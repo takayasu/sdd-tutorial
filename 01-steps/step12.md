@@ -4,268 +4,383 @@
 
 ### これは何か
 
-domain-model-section2.md のDSLをAI（Kiro CLI）で型定義に変換する。Step 6では在庫ロットだけだったが、ここでは「直接販売案件」「価格査定」「販売契約」という、より複雑なビジネス概念を型で表現する。
+`domain-model-section2.md` の DSL を Python frozen dataclass と TypeScript discriminated union に変換する。Step 6 では在庫ロットだけだったが、ここでは「直接販売案件」「価格査定」「販売契約」という、より複雑なビジネス概念を型で表現する。
 
 ### なぜやるのか
 
-- 直接販売案件は5段階の状態（査定前→査定済み→契約済み→出荷指示→出荷完了）を持ち、各段階で保持するデータが増えていく
+- 直接販売案件は5段階の状態（査定前→査定済み→契約済み→出荷指示→出荷完了）を持ち、各段階で保持するデータが累積的に増える
 - 「査定前の案件に契約を締結する」といった業務上ありえない操作を、型レベルで防ぐ
-- Step 6で学んだ「状態を型で表現する」パターンを、より複雑なドメインに適用する
+- Step 6 で学んだ「状態を型で表現する」パターンを、より複雑なドメインに適用する
 
 ### 何がうれしいのか
 
 - ビジネスルールの複雑さが増しても、型が正しさを保証してくれる
-- 既存のCI（フォーマッター、リンター、PBT）がそのまま動くことで、「新しいコードを追加しても既存が壊れていない」ことが自動確認される
+- 既存の CI（フォーマッター、リンター、PBT）がそのまま動くことで、「新しいコードを追加しても既存が壊れていない」ことが自動確認される
 
 ## 完了条件
 
-### F#
-
 ```bash
-$ cd ../sales-management/apps/api-fsharp
-$ dotnet build
-  Build succeeded.
-      0 Warning(s)
-      0 Error(s)
+# Python: 型チェック通過
+$ cd backend && mypy src/domain/sales_case.py --strict
+Success: no issues found in 1 source file
 
-# 既存のPBTも引き続き通ること
-$ dotnet test --filter "Category=PBT"
-  Passed!  - Failed:     0, Passed:     3, Skipped:     0, Total:     3
-```
+# Python: リントチェック通過
+$ ruff check src/domain/sales_case.py
+All checks passed!
 
-### Kotlin
-
-```bash
-$ cd kotlin
-$ gradle build
-BUILD SUCCESSFUL in Xs
-
-# 既存のPBTも引き続き通ること
-$ gradle test --tests "*PropertyTest*"
-BUILD SUCCESSFUL in Xs
-3 tests completed, 0 failed
+# TypeScript: 型チェック通過
+$ cd frontend && npx tsc --noEmit
+（エラーなし）
 ```
 
 ---
 
-## Kiro CLIでの変換
+## Python 型定義
 
-domain-model-section2.md をコンテキストとして渡し、型定義を生成する。Step 6で作成した型を参照する形で追加する。
+### src/domain/sales_case.py
 
----
+```python
+from __future__ import annotations
 
-## F# 期待される型定義の構造
+from dataclasses import dataclass
+from datetime import date
+from typing import Literal
 
-```fsharp
-// Domain/SalesCaseTypes.fs
-module SalesManagement.Domain.SalesCaseTypes
+from src.domain.lot import Amount, InventoryLot, LotCommon
 
-open System
-open SalesManagement.Domain.Types
 
-// 追加の基本値型
-type SalesCaseNumber = {
-    Year: int
-    Month: int
-    Seq: int
-}
+# ---------- 識別番号 ----------
 
-type AppraisalNumber = {
-    Year: int
-    Month: int
-    Seq: int
-}
+@dataclass(frozen=True)
+class SalesCaseNumber:
+    year: int
+    month: int
+    seq: int
 
-type ContractNumber = {
-    Year: int
-    Month: int
-    Seq: int
-}
+    def __post_init__(self) -> None:
+        if not (2000 <= self.year <= 2099):
+            raise ValueError(f"year must be 2000–2099, got {self.year}")
+        if not (1 <= self.month <= 12):
+            raise ValueError(f"month must be 1–12, got {self.month}")
+        if self.seq < 1:
+            raise ValueError(f"seq must be >= 1, got {self.seq}")
 
-// 販売案件共通
-type SalesCaseCommon = {
-    SalesCaseNumber: SalesCaseNumber
-    DivisionCode: DivisionCode
-    SalesDate: DateOnly
-    Lots: InventoryLot list  // 1件以上
-}
 
-// 価格査定
-type AppraisalCommon = {
-    AppraisalNumber: AppraisalNumber
-    AppraisalDate: DateOnly
-    DeliveryDate: DateOnly
-    SalesMarket: string
-    BaseUnitPriceDate: string
-    PeriodAdjustmentRateDate: string
-    CounterpartyAdjustmentRateDate: string
-    TaxExcludedEstimatedTotal: Amount
-    LotAppraisals: LotAppraisal list  // 1件以上
-}
+@dataclass(frozen=True)
+class AppraisalNumber:
+    year: int
+    month: int
+    seq: int
 
-type NormalAppraisal = { Common: AppraisalCommon }
 
-type AgreementAppraisal = {
-    Common: AppraisalCommon
-    CustomerContractNumber: string
-    ContractAdjustmentRate: decimal
-}
+@dataclass(frozen=True)
+class ContractNumber:
+    year: int
+    month: int
+    seq: int
 
-type PriceAppraisal =
-    | Normal of NormalAppraisal
-    | Agreement of AgreementAppraisal
 
-// 販売契約
-type Buyer = {
-    CustomerNumber: string
-    AgentName: string option
-}
+# ---------- 価格査定 ----------
 
-type SalesInfo = {
-    SalesType: int
-    Item: string
-    DeliveryMethod: string
-    PaymentDeferralCondition: string option
-    SalesMethod: int
-    Reason: string option
-    Usage: string option
-    PaymentDeferralAmount: Amount option
-}
+@dataclass(frozen=True)
+class AppraisalCommon:
+    appraisal_number: AppraisalNumber
+    appraisal_date: date
+    delivery_date: date
+    sales_market: str
+    base_unit_price_date: str
+    period_adjustment_rate_date: str
+    counterparty_adjustment_rate_date: str
+    tax_excluded_estimated_total: Amount
+    lot_appraisals: tuple[LotCommon, ...]  # 1件以上
 
-type SalesPriceInfo = {
-    TaxExcludedContractAmountTaxable: Amount
-    ConsumptionTax: Amount
-    TaxExcludedPaymentAmount: Amount
-    PaymentConsumptionTax: Amount
-}
+    def __post_init__(self) -> None:
+        if len(self.lot_appraisals) < 1:
+            raise ValueError("lot_appraisals must have at least 1 item")
 
-type SalesContract = {
-    ContractNumber: ContractNumber
-    ContractDate: DateOnly
-    Person: string
-    Buyer: Buyer
-    SalesInfo: SalesInfo
-    SalesPriceInfo: SalesPriceInfo
-    AppraisalNumber: AppraisalNumber
-}
 
-// 出荷指示情報
-type ShippingInstructionInfo = {
-    ShippingInstructionDate: DateOnly
-}
+@dataclass(frozen=True)
+class NormalAppraisal:
+    common: AppraisalCommon
+    kind: Literal["normal"] = "normal"
 
-// 直接販売案件（状態を型で表現）
-type BeforeAppraisalCase = { Common: SalesCaseCommon }
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "kind", "normal")
 
-type AppraisedCase = {
-    Common: SalesCaseCommon
-    Appraisal: PriceAppraisal
-}
 
-type ContractedCase = {
-    Common: SalesCaseCommon
-    Appraisal: PriceAppraisal
-    Contract: SalesContract
-}
+@dataclass(frozen=True)
+class AgreementAppraisal:
+    common: AppraisalCommon
+    customer_contract_number: str
+    contract_adjustment_rate: float
+    kind: Literal["agreement"] = "agreement"
 
-type ShippingInstructedCase = {
-    Common: SalesCaseCommon
-    Appraisal: PriceAppraisal
-    Contract: SalesContract
-    ShippingInstruction: ShippingInstructionInfo
-}
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "kind", "agreement")
 
-type ShippingCompletedCase = {
-    Common: SalesCaseCommon
-    Appraisal: PriceAppraisal
-    Contract: SalesContract
-    ShippingInstruction: ShippingInstructionInfo
-    ShippingCompletedDate: DateOnly
-}
 
-type DirectSalesCase =
-    | BeforeAppraisal of BeforeAppraisalCase
-    | Appraised of AppraisedCase
-    | Contracted of ContractedCase
-    | ShippingInstructed of ShippingInstructedCase
-    | ShippingCompleted of ShippingCompletedCase
-```
+PriceAppraisal = NormalAppraisal | AgreementAppraisal
 
----
 
-## Kotlin 期待される型定義の構造
+# ---------- 販売契約 ----------
 
-```kotlin
-// domain/SalesCaseTypes.kt
-package salesmanagement.domain
+@dataclass(frozen=True)
+class Buyer:
+    customer_number: str
+    agent_name: str | None = None
 
-import java.time.LocalDate
 
-data class SalesCaseNumber(val year: Int, val month: Int, val seq: Int)
-data class AppraisalNumber(val year: Int, val month: Int, val seq: Int)
-data class ContractNumber(val year: Int, val month: Int, val seq: Int)
+@dataclass(frozen=True)
+class SalesInfo:
+    sales_type: int
+    item: str
+    delivery_method: str
+    sales_method: int
+    payment_deferral_condition: str | None = None
+    reason: str | None = None
+    usage: str | None = None
+    payment_deferral_amount: Amount | None = None
 
-data class SalesCaseCommon(
-    val salesCaseNumber: SalesCaseNumber,
-    val divisionCode: DivisionCode,
-    val salesDate: LocalDate,
-    val lots: List<InventoryLot>  // 1件以上
+
+@dataclass(frozen=True)
+class SalesPriceInfo:
+    tax_excluded_contract_amount_taxable: Amount
+    consumption_tax: Amount
+    tax_excluded_payment_amount: Amount
+    payment_consumption_tax: Amount
+
+
+@dataclass(frozen=True)
+class SalesContract:
+    contract_number: ContractNumber
+    contract_date: date
+    person: str
+    buyer: Buyer
+    sales_info: SalesInfo
+    sales_price_info: SalesPriceInfo
+    appraisal_number: AppraisalNumber
+
+
+# ---------- 直接販売案件（5段階の状態） ----------
+
+@dataclass(frozen=True)
+class SalesCaseCommon:
+    sales_case_number: SalesCaseNumber
+    division_code: int
+    sales_date: date
+    lots: tuple[InventoryLot, ...]  # 1件以上
+
+    def __post_init__(self) -> None:
+        if len(self.lots) < 1:
+            raise ValueError("lots must have at least 1 item")
+
+
+@dataclass(frozen=True)
+class BeforeAppraisalCase:
+    """査定前"""
+    common: SalesCaseCommon
+    status: Literal["before_appraisal"] = "before_appraisal"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", "before_appraisal")
+
+
+@dataclass(frozen=True)
+class AppraisedCase:
+    """査定済み"""
+    common: SalesCaseCommon
+    appraisal: PriceAppraisal
+    status: Literal["appraised"] = "appraised"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", "appraised")
+
+
+@dataclass(frozen=True)
+class ContractedCase:
+    """契約済み"""
+    common: SalesCaseCommon
+    appraisal: PriceAppraisal
+    contract: SalesContract
+    status: Literal["contracted"] = "contracted"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", "contracted")
+
+
+@dataclass(frozen=True)
+class ShippingInstructedCase:
+    """出荷指示済み"""
+    common: SalesCaseCommon
+    appraisal: PriceAppraisal
+    contract: SalesContract
+    shipping_instruction_date: date
+    status: Literal["shipping_instructed"] = "shipping_instructed"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", "shipping_instructed")
+
+
+@dataclass(frozen=True)
+class ShippingCompletedCase:
+    """出荷完了"""
+    common: SalesCaseCommon
+    appraisal: PriceAppraisal
+    contract: SalesContract
+    shipping_instruction_date: date
+    shipping_completed_date: date
+    status: Literal["shipping_completed"] = "shipping_completed"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", "shipping_completed")
+
+
+DirectSalesCase = (
+    BeforeAppraisalCase
+    | AppraisedCase
+    | ContractedCase
+    | ShippingInstructedCase
+    | ShippingCompletedCase
 )
+```
 
-// 価格査定
-sealed interface PriceAppraisal {
-    val common: AppraisalCommon
+---
 
-    data class Normal(override val common: AppraisalCommon) : PriceAppraisal
-    data class Agreement(
-        override val common: AppraisalCommon,
-        val customerContractNumber: String,
-        val contractAdjustmentRate: Double
-    ) : PriceAppraisal
+## TypeScript 型定義
+
+### src/types/sales_case.ts
+
+```typescript
+import type { InventoryLot } from '@/types/lot'
+
+// ---------- 識別番号 ----------
+
+export interface SalesCaseNumber {
+  readonly year: number
+  readonly month: number
+  readonly seq: number
 }
 
-// 販売契約
-data class SalesContract(
-    val contractNumber: ContractNumber,
-    val contractDate: LocalDate,
-    val person: String,
-    val buyer: Buyer,
-    val salesInfo: SalesInfo,
-    val salesPriceInfo: SalesPriceInfo,
-    val appraisalNumber: AppraisalNumber
-)
-
-// 出荷指示情報
-data class ShippingInstructionInfo(val shippingInstructionDate: LocalDate)
-
-// 直接販売案件
-sealed interface DirectSalesCase {
-    val common: SalesCaseCommon
-
-    data class BeforeAppraisal(override val common: SalesCaseCommon) : DirectSalesCase
-    data class Appraised(
-        override val common: SalesCaseCommon,
-        val appraisal: PriceAppraisal
-    ) : DirectSalesCase
-    data class Contracted(
-        override val common: SalesCaseCommon,
-        val appraisal: PriceAppraisal,
-        val contract: SalesContract
-    ) : DirectSalesCase
-    data class ShippingInstructed(
-        override val common: SalesCaseCommon,
-        val appraisal: PriceAppraisal,
-        val contract: SalesContract,
-        val shippingInstruction: ShippingInstructionInfo
-    ) : DirectSalesCase
-    data class ShippingCompleted(
-        override val common: SalesCaseCommon,
-        val appraisal: PriceAppraisal,
-        val contract: SalesContract,
-        val shippingInstruction: ShippingInstructionInfo,
-        val shippingCompletedDate: LocalDate
-    ) : DirectSalesCase
+export interface AppraisalNumber {
+  readonly year: number
+  readonly month: number
+  readonly seq: number
 }
+
+export interface ContractNumber {
+  readonly year: number
+  readonly month: number
+  readonly seq: number
+}
+
+// ---------- 価格査定 ----------
+
+export interface AppraisalCommon {
+  readonly appraisalNumber: AppraisalNumber
+  readonly appraisalDate: string
+  readonly deliveryDate: string
+  readonly salesMarket: string
+  readonly baseUnitPriceDate: string
+  readonly periodAdjustmentRateDate: string
+  readonly counterpartyAdjustmentRateDate: string
+  readonly taxExcludedEstimatedTotal: number
+  readonly lotAppraisals: readonly InventoryLot[]
+}
+
+export interface NormalAppraisal {
+  readonly kind: 'normal'
+  readonly common: AppraisalCommon
+}
+
+export interface AgreementAppraisal {
+  readonly kind: 'agreement'
+  readonly common: AppraisalCommon
+  readonly customerContractNumber: string
+  readonly contractAdjustmentRate: number
+}
+
+export type PriceAppraisal = NormalAppraisal | AgreementAppraisal
+
+// ---------- 販売契約 ----------
+
+export interface Buyer {
+  readonly customerNumber: string
+  readonly agentName?: string
+}
+
+export interface SalesInfo {
+  readonly salesType: number
+  readonly item: string
+  readonly deliveryMethod: string
+  readonly salesMethod: number
+  readonly paymentDeferralCondition?: string
+  readonly reason?: string
+  readonly usage?: string
+  readonly paymentDeferralAmount?: number
+}
+
+export interface SalesPriceInfo {
+  readonly taxExcludedContractAmountTaxable: number
+  readonly consumptionTax: number
+  readonly taxExcludedPaymentAmount: number
+  readonly paymentConsumptionTax: number
+}
+
+export interface SalesContract {
+  readonly contractNumber: ContractNumber
+  readonly contractDate: string
+  readonly person: string
+  readonly buyer: Buyer
+  readonly salesInfo: SalesInfo
+  readonly salesPriceInfo: SalesPriceInfo
+  readonly appraisalNumber: AppraisalNumber
+}
+
+// ---------- 直接販売案件（5段階の状態） ----------
+
+export interface SalesCaseCommon {
+  readonly salesCaseNumber: SalesCaseNumber
+  readonly divisionCode: number
+  readonly salesDate: string
+  readonly lots: readonly InventoryLot[]
+}
+
+export interface BeforeAppraisalCase extends SalesCaseCommon {
+  readonly status: 'before_appraisal'
+}
+
+export interface AppraisedCase extends SalesCaseCommon {
+  readonly status: 'appraised'
+  readonly appraisal: PriceAppraisal
+}
+
+export interface ContractedCase extends SalesCaseCommon {
+  readonly status: 'contracted'
+  readonly appraisal: PriceAppraisal
+  readonly contract: SalesContract
+}
+
+export interface ShippingInstructedCase extends SalesCaseCommon {
+  readonly status: 'shipping_instructed'
+  readonly appraisal: PriceAppraisal
+  readonly contract: SalesContract
+  readonly shippingInstructionDate: string
+}
+
+export interface ShippingCompletedCase extends SalesCaseCommon {
+  readonly status: 'shipping_completed'
+  readonly appraisal: PriceAppraisal
+  readonly contract: SalesContract
+  readonly shippingInstructionDate: string
+  readonly shippingCompletedDate: string
+}
+
+export type DirectSalesCase =
+  | BeforeAppraisalCase
+  | AppraisedCase
+  | ContractedCase
+  | ShippingInstructedCase
+  | ShippingCompletedCase
 ```
 
 ---
@@ -273,8 +388,9 @@ sealed interface DirectSalesCase {
 ## ポイント
 
 - 直接販売案件は5段階の状態を持ち、各段階で保持するデータが累積的に増える
-- 価格査定は通常/顧客契約の2種類（OR）で、顧客契約には追加フィールドがある
-- 販売契約は査定番号を持つことで、どの査定に基づくかを追跡できる
+- 価格査定は通常/顧客契約の2種類（`kind` で discriminate）で、顧客契約には追加フィールドがある
+- 販売契約は `appraisal_number` を持つことで、どの査定に基づくかを追跡できる
+- `lots` は 1件以上必須 → `__post_init__` で検証、TypeScript では `readonly` 配列
 
 ---
 

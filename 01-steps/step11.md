@@ -1,197 +1,183 @@
-# Step 11: SAST（Kotlinのみ）
+# Step 11: SAST（静的アプリケーションセキュリティテスト）
 
 ## 目的
 
 ### これは何か
 
-SAST（Static Application Security Testing）をCIに組み込む。SASTとは、コードを実行せずに解析し、セキュリティ上の脆弱性（SQLインジェクション、クロスサイトスクリプティング等）を検出するツール。ここではSonarQubeを使う。
+ソースコードを実行せずにセキュリティ脆弱性を検出する静的解析（SAST）を導入する。
+
+- Python: **bandit**（OWASP Top 10 に対応した Python 専用 SAST ツール）
+- TypeScript: ESLint の **eslint-plugin-security** ルール群（Step 5 の ESLint に追加）
 
 ### なぜやるのか
 
-- リンター（Step 5）が「コードの品質」を見るのに対し、SASTは「セキュリティの穴」を見る
-- 例：ユーザー入力をそのままSQLに埋め込んでいる箇所を検出する（SQLインジェクション）
-- F#には対応するSASTツールがないため、Kotlinのみ。F#は型設計で代替する
+- AIが生成したコードは `eval()` や `subprocess.shell=True` のような危険なパターンを使うことがある
+- `hardcoded_password` / `sql_injection` / `weak_cryptographic_key` を人間のレビューより先に検出できる
+- CI に組み込むことで「マージ前にセキュリティ問題を自動ブロック」できる
 
 ### 何がうれしいのか
 
-- セキュリティの専門知識がなくても、ツールが自動的に危険なコードを指摘してくれる
-- AIが生成したコードにセキュリティ上の問題があっても、CIで検出できる
-- SonarQubeのダッシュボードで脆弱性の一覧と修正方法が確認できる
+- `bandit -r src/` が OWASP カテゴリ付きで問題箇所を出力する
+- 深刻度（HIGH/MEDIUM/LOW）と確信度（HIGH/MEDIUM/LOW）の組み合わせで優先順位をつけられる
+- `# nosec B601` でホワイトリスト例外を明示的に記録できる
 
 ## 完了条件
 
 ```bash
-# SonarQubeが起動していることを確認
-$ curl -s http://localhost:9000/api/system/status
-{"id":"...","version":"10.x","status":"UP"}
+# Python SAST（MEDIUM 重大度・MEDIUM 確信度以上のみ CI でブロック）
+$ cd backend && bandit -r src/ -ll -ii
+Run started: ...
+No issues identified.
+$ echo $?
+0
 
-# Sonar解析を実行
-$ cd kotlin
-$ gradle sonar
-> Task :sonar
-BUILD SUCCESSFUL in Xs
+# TypeScript SAST（ESLint security rules）
+$ cd frontend && npx eslint src/
+（エラーなし）
 
-# 品質ゲートがパスしていることを確認
-$ curl -s "http://localhost:9000/api/qualitygates/project_status?projectKey=sales-management-kotlin" | python3 -m json.tool
-{
-    "projectStatus": {
-        "status": "OK",
-        ...
-    }
-}
-
-# ブラウザで http://localhost:9000 にアクセスすると
-# プロジェクトのダッシュボードが表示される
+# ci.sh が緑
+$ ./ci.sh
+=== SAST (Python) ===
+No issues identified.
+=== SAST (TypeScript) ===
+（エラーなし）
 ```
 
 ---
 
-## Kotlin（SonarQube）
+## Python（bandit）
 
-### 1. docker-compose.yml にSonarQubeを追加
+### 1. 依存追加（pyproject.toml）
 
-```yaml
-# kotlin/docker-compose.yml に追加
-services:
-  db:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_USER: app
-      POSTGRES_PASSWORD: app
-      POSTGRES_DB: sales_management
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-
-  sonarqube:
-    image: sonarqube:community
-    depends_on:
-      - sonarqube-db
-    environment:
-      SONAR_JDBC_URL: jdbc:postgresql://sonarqube-db:5432/sonarqube
-      SONAR_JDBC_USERNAME: sonar
-      SONAR_JDBC_PASSWORD: sonar
-    ports:
-      - "9000:9000"
-    volumes:
-      - sonarqube_data:/opt/sonarqube/data
-
-  sonarqube-db:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_USER: sonar
-      POSTGRES_PASSWORD: sonar
-      POSTGRES_DB: sonarqube
-    volumes:
-      - sonarqube_pgdata:/var/lib/postgresql/data
-
-volumes:
-  pgdata:
-  sonarqube_data:
-  sonarqube_pgdata:
+```toml
+[project.optional-dependencies]
+dev = [
+    ...
+    "bandit>=1.7",
+]
 ```
-
-### 2. SonarQube初期設定
 
 ```bash
-docker compose up -d sonarqube sonarqube-db
-
-# 起動を待つ（初回は1〜2分かかる）
-echo "SonarQubeの起動を待機中..."
-until curl -s http://localhost:9000/api/system/status | grep -q '"status":"UP"'; do
-    sleep 5
-done
-
-# 初期パスワード変更（admin/admin → admin/任意のパスワード）
-# ブラウザで http://localhost:9000 にアクセスして設定
+cd backend && uv sync
 ```
 
-### 3. Gradle設定追加（build.gradle.kts）
+### 2. bandit 設定（pyproject.toml）
 
-```kotlin
-plugins {
-    // 既存に追加
-    id("org.sonarqube") version "5.0.0.4638"
-}
-
-sonar {
-    properties {
-        property("sonar.projectKey", "sales-management-kotlin")
-        property("sonar.projectName", "Sales Management (Kotlin)")
-        property("sonar.host.url", "http://localhost:9000")
-        property("sonar.token", System.getenv("SONAR_TOKEN") ?: "")
-        property("sonar.coverage.jacoco.xmlReportPaths", "build/reports/jacoco/test/jacocoTestReport.xml")
-    }
-}
+```toml
+[tool.bandit]
+exclude_dirs = ["tests", "alembic"]
+skips = [
+    "B101",  # assert文（テストでの使用を許可）
+]
 ```
 
-### 4. トークン生成・実行
+### 3. 実行
 
 ```bash
-# SonarQubeのUIからトークンを生成し、環境変数に設定
-export SONAR_TOKEN="squ_xxxxx"
+cd backend
 
-# 解析実行
-gradle sonar
+# 全検出（開発時確認用）
+bandit -r src/
+
+# MEDIUM重大度・MEDIUM確信度以上のみ（CI用）
+bandit -r src/ -ll -ii
+
+# レポート出力
+bandit -r src/ -f json -o bandit-report.json
 ```
 
-### 5. ci.sh への追加
+### 4. 重大度フラグの意味
 
-```bash
-echo "=== SAST (SonarQube) ==="
-gradle sonar
-# 品質ゲートの確認
-curl -s "http://localhost:9000/api/qualitygates/project_status?projectKey=sales-management-kotlin" \
-  | grep -q '"status":"OK"' || (echo "品質ゲート失敗" && exit 1)
+| フラグ | 意味 |
+|---|---|
+| `-l` | LOW 以上を表示（デフォルト） |
+| `-ll` | MEDIUM 以上を表示 |
+| `-lll` | HIGH のみ表示 |
+| `-i` | 確信度 LOW 以上（デフォルト） |
+| `-ii` | 確信度 MEDIUM 以上 |
+| `-iii` | 確信度 HIGH のみ |
+
+CI では `-ll -ii`（MEDIUM以上・MEDIUM以上）を推奨。初期は `-lll -iii` から始めて徐々に厳しくする。
+
+### 5. よくある検出例
+
+```python
+# B602: subprocess の shell=True
+import subprocess
+subprocess.run("ls " + user_input, shell=True)  # NG: コマンドインジェクション
+
+# B311: 暗号学的に安全でない乱数
+import random
+token = random.randint(0, 2**32)  # NG
+
+import secrets
+token = secrets.token_hex(32)  # OK
+
+# B106: ハードコードされたパスワード
+password = "admin123"  # NG
+
+password = os.getenv("DB_PASSWORD")  # OK
 ```
 
 ---
 
-## F# の代替方針
+## TypeScript（eslint-plugin-security）
 
-F#にはSASTツールがないため、以下で代替する：
+### 1. 依存追加
 
-- 型設計で不正な入力を防ぐ（生文字列をSQL/HTMLに直接渡せない設計）
-- Donald のパラメータ化クエリで SQLインジェクションを防止
-- Step 20のDAST（OWASP ZAP）で実行時の脆弱性を検出
+```bash
+cd frontend
+pnpm add -D eslint-plugin-security
+```
+
+### 2. eslint.config.js に追加
+
+```javascript
+import js from '@eslint/js'
+import tseslint from 'typescript-eslint'
+import reactHooks from 'eslint-plugin-react-hooks'
+import reactRefresh from 'eslint-plugin-react-refresh'
+import security from 'eslint-plugin-security'
+
+export default tseslint.config(
+  { ignores: ['dist', 'coverage'] },
+  {
+    extends: [js.configs.recommended, ...tseslint.configs.recommended],
+    files: ['**/*.{ts,tsx}'],
+    plugins: {
+      'react-hooks': reactHooks,
+      'react-refresh': reactRefresh,
+      security,
+    },
+    rules: {
+      ...reactHooks.configs.recommended.rules,
+      'react-refresh/only-export-components': ['warn', { allowConstantExport: true }],
+      '@typescript-eslint/no-unused-vars': 'error',
+      '@typescript-eslint/no-explicit-any': 'warn',
+      'security/detect-object-injection': 'warn',
+      'security/detect-non-literal-regexp': 'warn',
+      'security/detect-unsafe-regex': 'error',
+      'security/detect-eval-with-expression': 'error',
+    },
+  },
+)
+```
 
 ---
 
-## ci.sh の現時点の構成（Kotlin）
+## ci.sh への追加
 
 ```bash
-#!/bin/bash
-set -e
-
-echo "=== マイグレーション ==="
-gradle flywayMigrate
-
-echo "=== ビルド ==="
-gradle build
-
-echo "=== フォーマットチェック ==="
-gradle ktfmtCheck
-
-echo "=== リンター ==="
-gradle detekt
-
-echo "=== テスト + カバレッジ ==="
-gradle test jacocoTestReport
-
-echo "=== SAST (SonarQube) ==="
-gradle sonar
-
-echo "=== シークレット検出 ==="
-gitleaks detect --source . --exit-code 1
-
-echo "=== パッケージ脆弱性スキャン ==="
-trivy fs --scanners vuln --severity HIGH,CRITICAL .
+echo "=== SAST (Python) ==="
+cd backend
+bandit -r src/ -ll -ii
+cd ..
 ```
+
+（TypeScript は Step 5 の ESLint が security rules も含めて実行するため追加コマンド不要）
 
 ---
 
 ## 次のステップ
 
-Step 11が完了したら [Step 12: 直接販売案件の型定義](./step12.md) へ進む。
-Phase 1のCI構築はこれで完成。以降はドメインモデルの拡張に集中する。
+Step 11が完了したら [Step 12: 販売案件ドメイン追加](./step12.md) へ進む。

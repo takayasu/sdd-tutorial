@@ -4,11 +4,11 @@
 
 ### これは何か
 
-Phase 1 で導入した全CIツール（gitleaks, Trivy, detekt, Roslyn, SonarQube, OWASP ZAP）の出力を、業界標準フォーマット **SARIF v2.1.0**（Static Analysis Results Interchange Format, OASIS標準）に統一し、`ci-results/merged.sarif` という1ファイルに集約する。
+Phase 1 で導入した全CIツール（gitleaks, pip-audit, bandit, eslint, OWASP ZAP）の出力を、業界標準フォーマット **SARIF v2.1.0**（Static Analysis Results Interchange Format, OASIS標準）に統一し、`ci-results/merged.sarif` という1ファイルに集約する。
 
 ### なぜやるのか
 
-- Phase 1 ではツールごとに出力形式が異なる：gitleaks=独自JSON、Trivy=独自JSON、detekt=XML、SonarQube=REST API、ZAP=HTML/MD。AIエージェントが結果を読むにはツールごとにパーサを書く必要があった
+- Phase 1 ではツールごとに出力形式が異なる：gitleaks=独自JSON、pip-audit=独自JSON、bandit=JSON/TEXT、ZAP=HTML/MD。AIエージェントが結果を読むにはツールごとにパーサを書く必要があった
 - SARIF は `level`, `ruleId`, `locations[].physicalLocation.artifactLocation.uri`, `message.text` という共通スキーマを持ち、`jq` 1コマンドで全失敗を抽出できる
 - 結果が機械可読になることで、Step 28 の AGENTS.md 自己学習ループの入力源になる
 
@@ -25,13 +25,13 @@ $ ./ci.sh
 === CI完了 ===
 
 $ ls ci-results/sarif/
-detekt.sarif  fsharp-build.sarif  gitleaks.sarif  sonar.sarif  trivy.sarif  zap.sarif
+bandit.sarif  eslint.sarif  gitleaks.sarif  pip_audit.sarif  zap.sarif
 
 $ ls ci-results/merged.sarif
 ci-results/merged.sarif
 
 $ jq '.runs | length' ci-results/merged.sarif
-6
+5
 
 $ jq '[.runs[].results[] | select(.level == "error")] | length' ci-results/merged.sarif
 0
@@ -41,7 +41,7 @@ $ echo $?
 
 ---
 
-## 0. ci-results/ の整備（共通）
+## 0. ci-results/ の整備
 
 Phase 1 ではツール出力先がバラバラだったが、Phase 2 では `ci-results/` に集約する。
 
@@ -58,17 +58,35 @@ git add .gitignore
 ci-results/
 ├── sarif/              # ツール別 SARIF
 │   ├── gitleaks.sarif
-│   ├── trivy.sarif
-│   ├── detekt.sarif
-│   ├── fsharp-build.sarif
-│   ├── sonar.sarif
+│   ├── pip_audit.sarif
+│   ├── bandit.sarif
+│   ├── eslint.sarif
 │   └── zap.sarif
 └── merged.sarif        # マージ済み（エージェント参照用）
 ```
 
 ---
 
-## 1. gitleaks（共通）
+## 追加パッケージ
+
+```toml
+# backend/pyproject.toml
+[project.optional-dependencies]
+dev = [
+    # ... 既存 ...
+    "sarif-tools>=3.0",   # SARIF マージ・分析
+]
+```
+
+```bash
+cd backend && uv pip install sarif-tools
+# フロントエンド
+cd frontend && pnpm add -D @microsoft/eslint-formatter-sarif
+```
+
+---
+
+## 1. gitleaks（ネイティブ SARIF）
 
 gitleaks は `--report-format sarif` でネイティブ SARIF 出力可能。
 
@@ -81,163 +99,125 @@ gitleaks detect --source . \
 
 ---
 
-## 2. Trivy（共通）
+## 2. pip-audit → SARIF 変換
 
-Trivy も `--format sarif` でネイティブ対応。
+pip-audit はネイティブ SARIF 非対応のため、JSON 出力を Python で変換する。
 
 ```bash
-trivy fs --scanners vuln --severity HIGH,CRITICAL \
-  --format sarif \
-  --output ci-results/sarif/trivy.sarif .
+# JSON 出力を取得
+cd backend
+uv run pip-audit --format json -o ../ci-results/pip_audit_raw.json || true
+cd ..
+
+# SARIF に変換
+python scripts/pip-audit-to-sarif.py \
+  ci-results/pip_audit_raw.json \
+  ci-results/sarif/pip_audit.sarif
+```
+
+`scripts/pip-audit-to-sarif.py`:
+
+```python
+#!/usr/bin/env python3
+import json
+import sys
+
+input_path, output_path = sys.argv[1], sys.argv[2]
+
+with open(input_path) as f:
+    data = json.load(f)
+
+results = []
+for dep in data.get("dependencies", []):
+    for vuln in dep.get("vulns", []):
+        results.append({
+            "ruleId": vuln["id"],
+            "level": "error",
+            "message": {"text": vuln["description"]},
+            "locations": [{
+                "physicalLocation": {
+                    "artifactLocation": {"uri": "backend/pyproject.toml"}
+                }
+            }],
+        })
+
+sarif = {
+    "$schema": "https://schemastore.azurewebsites.net/schemas/json/sarif-2.1.0.json",
+    "version": "2.1.0",
+    "runs": [{
+        "tool": {"driver": {"name": "pip-audit", "version": "1.0"}},
+        "results": results,
+    }],
+}
+
+with open(output_path, "w") as f:
+    json.dump(sarif, f, indent=2)
 ```
 
 ---
 
-## F#（Roslyn ErrorLog + SecurityCodeScan）
+## 3. bandit（ネイティブ SARIF）
 
-F# は SonarQube が使えないため、Roslyn の ErrorLog 機能と SecurityCodeScan で SARIF を出力する。
-
-### 1. SecurityCodeScan の追加
+bandit は `-f sarif` でネイティブ SARIF 出力可能。
 
 ```bash
-cd ../sales-management/apps/api-fsharp/src/SalesManagement
-dotnet add package SecurityCodeScan.VS2019 --version 5.6.7
+cd backend
+uv run bandit -r src/ -ll -ii -f sarif \
+  -o ../ci-results/sarif/bandit.sarif || true
+cd ..
 ```
-
-`SalesManagement.fsproj` に追加される `PackageReference` は以下のように `PrivateAssets` を設定して、配布物に含めない：
-
-```xml
-<PackageReference Include="SecurityCodeScan.VS2019" Version="5.6.7">
-  <PrivateAssets>all</PrivateAssets>
-  <IncludeAssets>runtime; build; native; contentfiles; analyzers</IncludeAssets>
-</PackageReference>
-```
-
-### 2. ビルドコマンドで ErrorLog を有効化
-
-```bash
-cd ../sales-management/apps/api-fsharp
-dotnet build /p:ErrorLog=../ci-results/sarif/fsharp-build.sarif%2cversion=2.1
-```
-
-`%2c` は `,` のURLエンコード。`version=2.1` で SARIF v2.1.0 形式を指定する。
-
-### F# 制約: FSharpLint と Fantomas の SARIF 非対応
-
-FSharpLint と Fantomas はネイティブで SARIF を出力しない。JSON/プレーンテキスト出力を SARIF に変換するヘルパースクリプト `scripts/lint-to-sarif.fsx` を同梱する。
-
-```fsharp
-// scripts/lint-to-sarif.fsx（抜粋）
-// 使い方: dotnet fsi scripts/lint-to-sarif.fsx <input.json> <output.sarif>
-open System.IO
-open System.Text.Json
-
-let inputPath = fsi.CommandLineArgs.[1]
-let outputPath = fsi.CommandLineArgs.[2]
-
-let lints = JsonDocument.Parse(File.ReadAllText inputPath)
-// FSharpLint の JSON 出力を SARIF v2.1.0 の results[] に変換
-// (詳細は実装時に省略 - ruleId, level, locations を埋める)
-```
-
-このスクリプトは Phase 2 では FSharpLint 結果を `ci-results/sarif/fsharplint.sarif` として書き出すが、本 step では Roslyn 出力で代表させる。
 
 ---
 
-## Kotlin（detekt + SonarQube → SARIF）
+## 4. eslint（SARIF フォーマッター）
 
-### 1. detekt の SARIF 出力
-
-`build.gradle.kts` の detekt ブロックを更新：
-
-```kotlin
-detekt {
-    toolVersion = "1.23.7"
-    config.setFrom(files("config/detekt/detekt.yml"))
-    buildUponDefaultConfig = true
-}
-
-tasks.withType<io.gitlab.arturbosch.detekt.Detekt>().configureEach {
-    reports {
-        html.required.set(true)
-        sarif.required.set(true)
-        sarif.outputLocation.set(file("../ci-results/sarif/detekt.sarif"))
-    }
-}
-```
-
-### 2. SonarQube → SARIF 変換スクリプト
-
-SonarQube Community Edition は SARIF エクスポートを直接サポートしないため、`api/issues/search` の JSON を `jq` で SARIF に整形する。
-
-`scripts/sonar-to-sarif.sh`:
+`@microsoft/eslint-formatter-sarif` を使って SARIF 出力する。
 
 ```bash
-#!/usr/bin/env bash
-set -euo pipefail
-SONAR_URL="${SONAR_URL:-http://localhost:9000}"
-SONAR_TOKEN="${SONAR_TOKEN:?SONAR_TOKEN required}"
-PROJECT="${1:-sales-management-kotlin}"
-OUT="${2:-ci-results/sarif/sonar.sarif}"
-
-curl -s -u "$SONAR_TOKEN:" \
-  "$SONAR_URL/api/issues/search?componentKeys=$PROJECT&ps=500" \
-  | jq -f scripts/sonar-to-sarif.jq > "$OUT"
+cd frontend
+pnpm eslint src/ \
+  --format @microsoft/eslint-formatter-sarif \
+  --output-file ../ci-results/sarif/eslint.sarif || true
+cd ..
 ```
 
-`scripts/sonar-to-sarif.jq`（抜粋）:
+---
 
-```jq
-{
-  "$schema": "https://schemastore.azurewebsites.net/schemas/json/sarif-2.1.0.json",
-  "version": "2.1.0",
-  "runs": [{
-    "tool": { "driver": { "name": "SonarQube" } },
-    "results": [.issues[] | {
-      "ruleId": .rule,
-      "level": (if .severity == "BLOCKER" or .severity == "CRITICAL" then "error" else "warning" end),
-      "message": { "text": .message },
-      "locations": [{
-        "physicalLocation": {
-          "artifactLocation": { "uri": .component },
-          "region": { "startLine": (.line // 1) }
-        }
-      }]
-    }]
-  }]
-}
-```
-
-### 3. OWASP ZAP の SARIF 出力
+## 5. OWASP ZAP の SARIF 出力
 
 ZAP の reporting add-on を有効化して SARIF テンプレートで出力する。
 
 ```bash
+cd backend
+uv run uvicorn src.main:app --host 0.0.0.0 --port 8000 &
+APP_PID=$!
+sleep 3
+
 docker run --rm --network host \
-  -v $(pwd)/openapi.yaml:/zap/openapi.yaml \
-  -v $(pwd)/ci-results/sarif:/zap/results \
+  -v "$(pwd)/../ci-results/sarif:/zap/results" \
   ghcr.io/zaproxy/zaproxy:stable \
   zap-api-scan.py \
-    -t /zap/openapi.yaml \
+    -t http://localhost:8000/openapi.json \
     -f openapi \
     -z "addonupdate;addoninstall sarifreport" \
     -J /zap/results/zap.sarif
+
+kill $APP_PID
+cd ..
 ```
 
 ---
 
-## SARIF マージ（共通）
+## SARIF マージ（sarif-tools）
 
-複数 SARIF ファイルを 1 つに統合するため、Microsoft の `Sarif.Multitool` を使う。
+Python の `sarif-tools` で複数 SARIF ファイルを 1 つに統合する。
 
 ```bash
-# 初回のみ
-dotnet tool install -g Sarif.Multitool --version 4.5.4
-
-# マージ実行
-sarif merge ci-results/sarif/*.sarif \
-  --output-file-path ci-results/merged.sarif \
-  --recurse false
+cd backend
+uv run python -m sarif merge \
+  ../ci-results/sarif/*.sarif \
+  -o ../ci-results/merged.sarif
+cd ..
 ```
 
 マージ後の確認：
@@ -245,10 +225,9 @@ sarif merge ci-results/sarif/*.sarif \
 ```bash
 $ jq '.runs[] | { tool: .tool.driver.name, results: (.results | length) }' ci-results/merged.sarif
 { "tool": "gitleaks", "results": 0 }
-{ "tool": "trivy", "results": 0 }
-{ "tool": "detekt", "results": 0 }
-{ "tool": "Microsoft (R) Visual F# Compiler", "results": 0 }
-{ "tool": "SonarQube", "results": 0 }
+{ "tool": "pip-audit", "results": 0 }
+{ "tool": "bandit", "results": 0 }
+{ "tool": "ESLint", "results": 0 }
 { "tool": "OWASP ZAP", "results": 0 }
 ```
 
@@ -267,81 +246,60 @@ gitleaks detect --source . \
   --exit-code 1
 
 echo "=== SCA (SARIF) ==="
-trivy fs --scanners vuln --severity HIGH,CRITICAL \
-  --format sarif --output ci-results/sarif/trivy.sarif .
+cd backend
+uv run pip-audit --format json -o ../ci-results/pip_audit_raw.json || true
+cd ..
+python scripts/pip-audit-to-sarif.py \
+  ci-results/pip_audit_raw.json \
+  ci-results/sarif/pip_audit.sarif
 
-# F#:
-echo "=== ビルド (SARIF) ==="
-dotnet build /p:ErrorLog=ci-results/sarif/fsharp-build.sarif%2cversion=2.1
+echo "=== SAST - Python (SARIF) ==="
+cd backend
+uv run bandit -r src/ -ll -ii -f sarif \
+  -o ../ci-results/sarif/bandit.sarif || true
+cd ..
 
-# Kotlin:
-echo "=== リンター (SARIF) ==="
-gradle detekt   # build.gradle.kts で sarif 出力先指定済み
-
-echo "=== SonarQube → SARIF ==="
-bash scripts/sonar-to-sarif.sh sales-management-kotlin ci-results/sarif/sonar.sarif
+echo "=== SAST - TypeScript (SARIF) ==="
+cd frontend
+pnpm eslint src/ \
+  --format @microsoft/eslint-formatter-sarif \
+  --output-file ../ci-results/sarif/eslint.sarif || true
+cd ..
 
 echo "=== DAST (SARIF) ==="
+cd backend
+uv run uvicorn src.main:app --host 0.0.0.0 --port 8000 &
+APP_PID=$!
+sleep 3
 docker run --rm --network host \
-  -v $(pwd)/openapi.yaml:/zap/openapi.yaml \
-  -v $(pwd)/ci-results/sarif:/zap/results \
+  -v "$(pwd)/../ci-results/sarif:/zap/results" \
   ghcr.io/zaproxy/zaproxy:stable \
-  zap-api-scan.py -t /zap/openapi.yaml -f openapi \
+  zap-api-scan.py \
+    -t http://localhost:8000/openapi.json \
+    -f openapi \
     -z "addonupdate;addoninstall sarifreport" \
     -J /zap/results/zap.sarif
+kill $APP_PID
+cd ..
 
 echo "=== SARIF マージ ==="
-sarif merge ci-results/sarif/*.sarif \
-  --output-file-path ci-results/merged.sarif --recurse false
-
-echo "=== SARIF サマリ ==="
-jq '[.runs[].results[]] | group_by(.level) | map({level: .[0].level, count: length})' \
-  ci-results/merged.sarif
-```
-
----
-
-## ci.sh の現時点の構成
-
-```bash
-#!/bin/bash
-set -e
-
-echo "=== ci-results/ 初期化 ==="
-mkdir -p ci-results/sarif
-
-echo "=== マイグレーション ==="
-echo "=== ビルド ==="
-echo "=== フォーマットチェック ==="
-echo "=== リンター ==="
-echo "=== テスト + カバレッジ ==="
-
-echo "=== シークレット検出 (SARIF) ==="
-gitleaks detect --source . \
-  --report-format sarif \
-  --report-path ci-results/sarif/gitleaks.sarif \
-  --exit-code 1
-
-echo "=== SCA (SARIF) ==="
-trivy fs --scanners vuln --severity HIGH,CRITICAL \
-  --format sarif --output ci-results/sarif/trivy.sarif .
-
-echo "=== SAST (SonarQube) ==="
-gradle sonar
-bash scripts/sonar-to-sarif.sh sales-management-kotlin ci-results/sarif/sonar.sarif
-
-echo "=== DAST (OWASP ZAP, SARIF) ==="
-# (アプリ起動 → ZAP実行 → アプリ停止)
-
-echo "=== SARIF マージ ==="
-sarif merge ci-results/sarif/*.sarif \
-  --output-file-path ci-results/merged.sarif --recurse false
+cd backend
+uv run python -m sarif merge \
+  ../ci-results/sarif/*.sarif \
+  -o ../ci-results/merged.sarif
+cd ..
 
 echo "=== SARIF サマリ ==="
 jq '[.runs[].results[]] | group_by(.level) | map({level: .[0].level, count: length})' \
   ci-results/merged.sarif
 
-echo "=== CI完了 ==="
+echo "=== エラー件数確認 ==="
+ERROR_COUNT=$(jq '[.runs[].results[] | select(.level == "error")] | length' ci-results/merged.sarif)
+if [ "$ERROR_COUNT" -gt 0 ]; then
+  echo "SARIF error count: $ERROR_COUNT — CI失敗"
+  exit 1
+fi
+echo "PASS sarif-error-count-zero"
 ```
 
 ---

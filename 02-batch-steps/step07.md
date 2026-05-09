@@ -144,9 +144,7 @@ awslocal events list-targets-by-rule --rule monthly-close-schedule --region $REG
 1. バッチをコマンドラインから実行し、正常完了すること:
 
 ```bash
-dotnet run --project tools/BatchRunner -- --job=monthly-close --date=2026-04
-# or
-gradle run --args="--job=monthly-close --date=2026-04"
+uv run python -m batch.runner --job=monthly-close --date=2026-04
 
 # → batch_job_execution.status = COMPLETED
 ```

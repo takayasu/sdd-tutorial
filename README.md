@@ -11,53 +11,54 @@
   * CI自動化
     * 従来型のコード複雑度評価、脆弱性スキャン
     * PBT（プロパティベーステスト）を含むテスト
-* Java + Spring Boot以外の模索
+* React / Python + FastAPI スタックでの実践
+  * フロントエンド：React + TypeScript（型安全なUI開発）
+  * バックエンド：Python + FastAPI（型安全なAPI、OpenAPI自動生成）
   * ビルドの高速化：フィードバックループの回数を増やす
-  * 言語レベルでの書き方の統一：汎用性が低い言語を選択することでハーネスに頼らず品質を安定させる
 
 ## PoCの詳細
 
 ### 前提
 
-- 日本語ドメインDSL（data / behavior）をSSoTとし、Kiro CLIでコードに変換する
+- 日本語ドメインDSL（data / behavior）をSSoTとし、AIでコードに変換する
 - DSLは人間が書く。AIが生成したコードはCIの全ステップ突破をもってOKとする
-- 選定基準：型安全性、ビルド速度、エコシステム成熟度
+- 選定基準：型安全性、開発速度、エコシステム成熟度
 - 関数型ドメインモデリングの考え方に基づく仕様駆動開発
-- 同一のDSLからF#・Kotlin両方のコードを生成し比較する
 
 ### フレームワーク・スタイル方針
 
-| 言語 | Webフレームワーク | DB接続 | マイグレーション | スタイル |
+| 層 | フレームワーク | DB接続 | マイグレーション | スタイル |
 |---|---|---|---|---|
-| F# | Giraffe（ASP.NET Core上） | Donald + Npgsql | DbUp | 関数型（標準） |
-| Kotlin | Ktor | Exposed | Flyway | 関数型スタイル（sealed class + data class + 純粋関数中心、varを避けimmutableデフォルト、Arrow活用） |
+| バックエンド | FastAPI（Python） | SQLAlchemy（async） | Alembic | 関数型スタイル（frozen dataclass + 純粋関数中心、ミューテーションを避けimmutableデフォルト） |
+| フロントエンド | React + TypeScript + Vite | — | — | 関数型Reactコンポーネント + Zod バリデーション |
 
 ### DB構成
 
 - PostgreSQL（docker-composeで構築）
-- マイグレーションツールでスキーマをコード管理する
+- Alembicでスキーマをコード管理する
 - CIではマイグレーション適用 → テスト実行の順で実行する
 
 ```
-migrations/
-├── V001__create_lot_table.sql
-├── V002__create_sales_case_table.sql
-└── V003__create_appraisal_table.sql
+alembic/
+└── versions/
+    ├── 001_create_lot_table.py
+    ├── 002_create_sales_case_table.py
+    └── 003_create_appraisal_table.py
 ```
 
 ### Exit Criteria
 
 1. 環境が構築できること
 2. 与えたDSL（domain-model-section1〜3.md）についてAPIを実装し、CIを突破していること
-3. 上記達成後、ビルドサイクル時間等の効率面を評価する
+3. 上記達成後、開発サイクル時間等の効率面を評価する
 
 #### 3の評価方法
 
-同一マシン上でF#・Kotlinそれぞれの `./ci.sh` を実行し、体感と実測で比較する。厳密なベンチマークではなく、開発サイクルの快適さを主観込みで判断する。
+`./ci.sh` を実行し、体感と実測で比較する。
 
 計測対象：
-- クリーンビルド時間（`dotnet build` / `gradle build`）
-- インクリメンタルビルド時間（1ファイル変更後の再ビルド）
+- 依存インストール時間（`pip install` / `npm install`）
+- テスト実行時間（`pytest` / `vitest run`）
 - CI全体の実行時間（`time ./ci.sh`）
 
 ---
@@ -71,9 +72,9 @@ migrations/
 1. Mutation (状態遷移)
 2. **詳細 GET** (`GET /xxx/{id}`)
 3. **一覧 GET** (`GET /xxx?status=&limit=&offset=` — `{ items, total, limit, offset }` 形式)
-4. **楽観ロック** (`version INTEGER NOT NULL DEFAULT 1` カラム + `WHERE version = @expected` UPDATE。競合時 **409 + problem+json**)
+4. **楽観ロック** (`version INTEGER NOT NULL DEFAULT 1` カラム + `WHERE version = :expected` UPDATE。競合時 **409 + problem+json**)
 5. **エラー形式統一** (`application/problem+json` (RFC 9457))
-6. **OpenAPI 完全記述** (`components.schemas` に `XxxResponse / XxxSummary / XxxListResponse` を全部定義)
+6. **OpenAPI 完全記述** (FastAPI の自動生成 + Pydantic スキーマで `XxxResponse / XxxSummary / XxxListResponse` を定義)
 7. **ci.sh verify セクションへ追記** (Step 1 で導入 — false-positive completion を構造的に防ぐ)
 8. **URL 集約規約** (販売案件系は `/sales-cases/{id}/{caseType}/...` に集約)
 
@@ -83,18 +84,18 @@ migrations/
 
 | Step | やること | CIスタック | 完了条件 |
 |---|---|---|---|
-| 0 | 環境構築（Docker, .NET SDK, Gradle） | なし | `dotnet --version` / `gradle --version` が通る |
-| 1 | Hello World API + 横断ミドルウェア (CORS/nosniff/CORP/problem+json) + ci.sh verify セクション + OpenAPI スケルトン | `dotnet build` / `gradle build` | `/health` 200 + セキュリティヘッダ + 404 が problem+json + verify が緑 |
-| 2 | docker-compose構築（PostgreSQL） | `docker-compose up -d` | DBに接続できる |
-| 3 | マイグレーション導入（DbUp / Flyway） | + マイグレーション適用 | テーブルが作成される |
-| 4 | フォーマッター導入 | + Fantomas / ktfmt | `--check` がCI上で通る |
-| 5 | リンター導入 | + FSharpLint / detekt | 警告0で通る |
+| 0 | 環境構築（Docker, Python, Node.js） | なし | `python --version` / `node --version` が通る |
+| 1 | Hello World API（FastAPI）+ React スケルトン + 横断ミドルウェア + ci.sh verify セクション + OpenAPI スケルトン | `pytest` / `vitest` | `/health` 200 + セキュリティヘッダ + 404 が problem+json + verify が緑 |
+| 2 | docker-compose構築（PostgreSQL） | `docker compose up -d` | DBに接続できる |
+| 3 | マイグレーション導入（Alembic） | + マイグレーション適用 | テーブルが作成される |
+| 4 | フォーマッター導入 | + ruff format / Prettier | `--check` がCI上で通る |
+| 5 | リンター導入 | + ruff check / ESLint | 警告0で通る |
 | 6 | 在庫ロットの型定義（domain-model-section1.mdから生成） | 変更なし | ビルドが通る |
 | 7 | 在庫ロット集約API完全パッケージ + DB永続化 (mutation + 詳細GET + 一覧GET + version + problem+json + openapi完全記述) | 変更なし | verify セクションで Lot 系の curl がすべて通る |
 | 8 | PBT導入（在庫ロットの状態遷移） | + テスト実行 | PBTが通る |
 | 9 | テストカバレッジ | + coverage計測 | カバレッジレポート出力 |
 | 10 | gitleaks + SCA | + gitleaks + Trivy | 検出0で通る |
-| 11 | SAST（Kotlinのみ） | + SonarQube | 高リスク検出0 |
+| 11 | SAST（bandit） | + bandit | 高リスク検出0 |
 
 ### Section 2: 直接販売案件実装
 
@@ -102,7 +103,7 @@ migrations/
 |---|---|---|---|
 | 12 | 直接販売案件 + 価格査定 + 販売契約の型定義（domain-model-section2.md） | 変更なし | ビルドが通る |
 | 13 | マイグレーション追加（販売案件・査定・契約テーブル、`version` カラム含む） | 変更なし | マイグレーション適用成功 |
-| 14 | 直接販売案件 集約API完全パッケージ + URL 集約規約 (`/sales-cases/{id}/direct/...`) | 変更なし | PBT + verify セクションで SalesCase 系の curl がすべて通る (caseType ポリモーフィック GET / 一覧 / 409 / 400 / レガシー URL 404) |
+| 14 | 直接販売案件 集約API完全パッケージ + URL 集約規約 (`/sales-cases/{id}/direct/...`) | 変更なし | PBT + verify セクションで SalesCase 系の curl がすべて通る |
 | 15 | 価格査定・販売契約のAPI実装 (Step 14 と同じ規約) | 変更なし | PBT + verify (appraisal/contract の version conflict 409 含む) |
 
 ### Section 3: 予約・委託実装 + ダッシュボード
@@ -111,10 +112,10 @@ migrations/
 |---|---|---|---|
 | 16 | 予約・委託販売案件の型定義（domain-model-section3.md） | 変更なし | ビルドが通る |
 | 17 | マイグレーション追加（予約・委託テーブル、`version` カラム含む） | 変更なし | マイグレーション適用成功 |
-| 18 | 予約・委託・品目変換のAPI実装 (URL は `/sales-cases/{id}/{reservation\|consignment}/...` に集約) | 変更なし | PBT + verify (caseType=reservation/consignment の一覧/詳細/version 含む) |
+| 18 | 予約・委託・品目変換のAPI実装 | 変更なし | PBT + verify (caseType=reservation/consignment の一覧/詳細/version 含む) |
 | 18b | 認証 ON 化 + DevTokenMint CLI + `/auth/config` パブリックエンドポイント | 変更なし | verify セクションが auth=off / auth=on の 2 周どちらも緑 |
-| 19 | 品質ダッシュボード構築 | + Grafana / SonarQube | メトリクスが可視化される |
-| 20 | DAST | + OWASP ZAP | **`FAIL-NEW: 0` かつ `WARN-NEW: 0`** で `./ci.sh` が exit 0 (CSV content-type 明記 + lotId 入力検証も含む) |
+| 19 | 品質ダッシュボード構築 | + Grafana | メトリクスが可視化される |
+| 20 | DAST | + OWASP ZAP | **`FAIL-NEW: 0` かつ `WARN-NEW: 0`** で `./ci.sh` が exit 0 |
 
 ### Section 4: Phase 2 — ハーネスエンジニアリング（RALPHループ構築）
 
@@ -122,14 +123,14 @@ Phase 1 のCIは「人間がCIを読んで修正する」前提で組まれて�
 
 | Step | やること | 追加スタック | 完了条件 |
 |---|---|---|---|
-| 21 | SARIF統一出力 | + Sarif.Multitool, Roslyn ErrorLog, sarifreport (ZAP) | merged.sarif が生成される |
-| 22 | ミューテーションテスト | + Stryker.NET / PITest | Mutation Score ≥ 75% |
-| 23 | アーキテクチャ適合性検査 | + ArchUnitNET / ArchUnit | レイヤルール 4件 pass |
-| 24 | APIコントラクトテスト | + PactNet / pact-jvm + Pact Broker | can-i-deploy が yes |
-| 25 | SBOM生成 | + CycloneDX | sbom.cdx.json が生成される |
+| 21 | SARIF統一出力 | + sarif-tools (Python) | merged.sarif が生成される |
+| 22 | ミューテーションテスト | + mutmut (Python) | Mutation Score ≥ 75% |
+| 23 | アーキテクチャ適合性検査 | + import-linter | レイヤルール pass |
+| 24 | APIコントラクトテスト | + schemathesis | スキーマ適合テストが pass |
+| 25 | SBOM生成 | + cyclonedx-bom | sbom.cdx.json が生成される |
 | 26 | 依存関係自動更新 | + Renovate (npx) | dry-run pass |
 | 27 | OpenTelemetryエージェントトレース | + Jaeger + .claude/hooks | Jaeger に span が見える |
-| 28 | AGENTS.md自動更新 + `/security-review` skill 統合（最小RALPH） | + Stop hook + sarif-to-lessons + security-review→SARIF | AGENTS.md に教訓 (静的ツール由来 + レビュー由来) が追記される |
+| 28 | AGENTS.md自動更新 + `/security-review` skill 統合 | + Stop hook + sarif-to-lessons | AGENTS.md に教訓が追記される |
 | 29 | マルチエージェントオーケストレーター | + .harness/master.py + 4 subagents | 4エージェントが協調動作 |
 | 30 | 完全自律RALPHループ | + harness/ralph.sh + prd.md | prd.md 全項目が [x] になる |
 
@@ -139,10 +140,10 @@ Phase 1 のCIは「人間がCIを読んで修正する」前提で組まれて�
 
 ### ツール
 
-| 言語 | PBTライブラリ |
+| 層 | PBTライブラリ |
 |---|---|
-| F# | FsCheck.Xunit（xUnit + FsCheck 3） |
-| Kotlin | Kotest Property Testing |
+| Python（バックエンド） | hypothesis |
+| TypeScript（フロントエンド） | fast-check |
 
 ### テスト対象のプロパティ例
 
@@ -163,11 +164,11 @@ Phase 1 のCIは「人間がCIを読んで修正する」前提で組まれて�
 ### CIへの組み込み
 
 ```bash
-# F#
-dotnet test --filter "Category=PBT"
+# Python（hypothesis）
+pytest -m pbt backend/
 
-# Kotlin
-gradle test --tests "*PropertyTest*"
+# TypeScript（fast-check）
+npx vitest run src/**/*.pbt.test.ts
 ```
 
 PBTはStep 8で導入し、以降の全ステップで新しいbehaviorを追加するたびにPBTも追加する。
@@ -176,25 +177,27 @@ PBTはStep 8で導入し、以降の全ステップで新しいbehaviorを追加
 
 ## 用語集：CIで使うツールの説明
 
-このPoCで使うツールを、役割ごとに簡潔に説明する。
-
 | カテゴリ | ツール名 | 一言で言うと |
 |---|---|---|
-| フォーマッター | Fantomas / ktfmt | コードの見た目（インデント、改行）を自動統一する。人による書き方のバラつきをゼロにする |
-| リンター | FSharpLint / detekt | コードの「品質上の問題」を自動検出する。長すぎる関数、深すぎるネスト、マジックナンバー等 |
-| PBT | FsCheck.Xunit / Kotest Property | ランダムな入力を大量生成し、「どんな入力でもこの性質を満たす」ことを検証するテスト手法 |
-| カバレッジ | coverlet / JaCoCo | テストで実行されたコードの割合を計測する。テストが足りない箇所を可視化 |
+| フォーマッター | ruff format | コードの見た目（インデント、改行）を自動統一する。Pythonの標準スタイルを強制 |
+| フォーマッター | Prettier | TypeScript/JSXの見た目を自動統一する |
+| リンター | ruff check | コードの「品質上の問題」を自動検出する。長すぎる関数、未使用変数等 |
+| リンター | ESLint | TypeScript/Reactのコード品質問題を検出する |
+| PBT | hypothesis | ランダムな入力を大量生成し、「どんな入力でもこの性質を満たす」ことを検証するテスト手法（Python） |
+| PBT | fast-check | TypeScript版のPBTライブラリ |
+| カバレッジ | pytest-cov | テストで実行されたコードの割合を計測する（Python） |
+| カバレッジ | @vitest/coverage-v8 | フロントエンドのカバレッジを計測する（TypeScript） |
 | シークレット検出 | gitleaks | コード中にパスワードやAPIキーが含まれていないかをスキャンする |
 | SCA | Trivy | 使っているライブラリに既知の脆弱性がないかをスキャンする |
-| SAST | SonarQube | コードを実行せずに解析し、セキュリティ上の脆弱性を検出する（Kotlinのみ） |
+| SAST | bandit | Pythonコードを実行せずに解析し、セキュリティ上の脆弱性を検出する |
 | DAST | OWASP ZAP | 実際に動いているAPIに攻撃を模擬し、脆弱性を検出する |
-| マイグレーション | DbUp / Flyway | DBのテーブル構造の変更履歴をSQLファイルで管理し、コマンド1つで適用する |
-| ダッシュボード | Grafana / SonarQube | CIの実行結果（カバレッジ、複雑度等）を時系列グラフで可視化する |
-| SARIF統一 | Sarif.Multitool | 各ツールのSARIFを1ファイルにマージする（エージェント可読化） |
-| ミューテーションテスト | Stryker.NET / PITest | コードを機械的に変異させてテストの厳しさを測る |
-| アーキテクチャテスト | ArchUnitNET / ArchUnit | レイヤ依存ルールをコードで強制する |
-| コントラクトテスト | PactNet / pact-jvm + Pact Broker | API消費者と提供者の契約を機械検証する |
-| SBOM | CycloneDX | 依存ライブラリの部品表を生成する |
+| マイグレーション | Alembic | DBのテーブル構造の変更履歴をPythonファイルで管理し、コマンド1つで適用する |
+| ダッシュボード | Grafana | CIの実行結果（カバレッジ等）を時系列グラフで可視化する |
+| SARIF統一 | sarif-tools | 各ツールのSARIFを1ファイルにマージする（エージェント可読化） |
+| ミューテーションテスト | mutmut | コードを機械的に変異させてテストの厳しさを測る（Python） |
+| アーキテクチャテスト | import-linter | レイヤ依存ルールをコードで強制する（Python） |
+| コントラクトテスト | schemathesis | OpenAPIスキーマに対してファジングテストを自動実行する |
+| SBOM | cyclonedx-bom | 依存ライブラリの部品表を生成する |
 | 依存自動更新 | Renovate | 依存ライブラリの最新化PRを自動作成する |
 | エージェント観測 | OpenTelemetry + Jaeger | エージェントのツール実行をトレースとして可視化する |
 | 自己学習 | Claude Code Stop hook | CI失敗パターンをAGENTS.mdに自動追記する |
@@ -217,63 +220,40 @@ Phase 2 の理論的背景は arXiv 2604.08224 *"Externalization in LLM Agents: 
 
 ---
 
-## 比較サマリ
-
-| 観点 | F# | Kotlin |
-|---|---|---|
-| DSLとの構造的一致 | ◎ DSLがほぼ1:1で型に変換される | ○ sealed class + data classで表現可能だがやや冗長 |
-| 不正な状態の排除 | ◎ 判別共用体 + 網羅的パターンマッチ + 不変デフォルト | ○ sealed class + when式。Arrow等でResult/Either活用 |
-| ビルド速度 | ○ クリーン5〜15秒、インクリメンタル1〜5秒 | ○ Ktor: 15〜30秒（Spring Bootより大幅に速い） |
-| SAST（コード脆弱性） | × F#向けSASTなし。型設計で代替 | ○ SonarQube公式対応 |
-| 複雑度メトリクス | × 専用ツールなし。scc予約 + FSharpLintで簡易チェック | ◎ detekt + SonarQube |
-| 品質ダッシュボード | × 自前構築が必要（CI + Grafana） | ◎ SonarQubeで即利用可能 |
-| エコシステム全般 | ○ .NET（ASP.NET Core, NuGet）は成熟 | ◎ JVM（Ktor, Maven/Gradle）は最大級 |
-| 日本語情報・採用実績 | △ 少ない | ◎ 多い |
-
-### トレードオフの構造
-
-- **F#**: 型安全性が高い → そもそもバグ・複雑さが生まれにくい → メトリクスの必要性が下がる。ただしツールで品質を「証明」できない
-- **Kotlin**: 型安全性はF#より劣る → ツールで品質を計測・可視化して補う → 組織的に品質を管理しやすい。ただし型で防げない不正状態はPBTとツールに依存する
-
----
-
 ## ツールチェーン
 
-### F#
+### バックエンド（Python + FastAPI）
 
 | 観点 | ツール | 備考 |
 |---|---|---|
-| Webフレームワーク | Giraffe（ASP.NET Core上） | 軽量。ビルドへの影響小 |
-| ビルド | `dotnet build` | 追加設定不要 |
-| DB接続 | Donald + Npgsql | F#ネイティブ。パイプラインで記述 |
-| マイグレーション | DbUp | SQLファイルを順番に適用するだけ |
-| リンター | FSharpLint | Ionide統合済み |
-| フォーマッター | Fantomas | `dotnet fantomas` でCI実行可 |
-| テスト | xUnit + FsCheck.Xunit | PBT統合済み（`[<Property>]` + `[<Trait("Category","PBT")>]`） |
-| 複雑度メトリクス | scc | `scc --by-file --format json` |
-| SAST | なし（型設計で代替） | |
+| Webフレームワーク | FastAPI | 非同期対応、型ヒント統合、OpenAPI自動生成 |
+| ASGI サーバー | uvicorn | 開発・本番共用 |
+| パッケージ管理 | uv + pyproject.toml | Rust製の高速パッケージマネージャ |
+| DB接続 | SQLAlchemy (async) + asyncpg | 非同期ORM |
+| マイグレーション | Alembic | `alembic upgrade head` でCI実行可 |
+| リンター+フォーマッター | ruff | Black + flake8 + isort を統合した高速ツール |
+| テスト | pytest + pytest-asyncio | 非同期テスト対応 |
+| PBT | hypothesis | `@given` デコレータでPBT |
+| カバレッジ | pytest-cov | `--cov` フラグでカバレッジ計測 |
+| SAST | bandit | Pythonセキュリティ静的解析 |
 | DAST | OWASP ZAP | |
-| SCA | `dotnet list package --vulnerable` + Trivy | |
+| SCA | Trivy | |
 | シークレット検出 | gitleaks | |
-| 品質ダッシュボード | CI出力（JSON） → Grafana | 自前構築 |
 
-### Kotlin
+### フロントエンド（React + TypeScript + Vite）
 
 | 観点 | ツール | 備考 |
 |---|---|---|
-| Webフレームワーク | Ktor | 関数型スタイルに適合 |
-| ビルド | Gradle（Kotlin DSL） | daemon + インクリメンタルビルド |
-| DB接続 | Exposed（DSLモード） | Kotlin向け軽量ORM。関数型寄り |
-| マイグレーション | Flyway | Gradle plugin対応。`gradle flywayMigrate` |
-| リンター | detekt | 複雑度・コードスメル一括チェック |
-| フォーマッター | ktfmt | `ktfmt --kotlinlang-style` |
-| テスト | Kotest（Property Testing） | PBT内蔵 |
-| 複雑度メトリクス | detekt + SonarQube | |
-| SAST | SonarQube | |
-| DAST | OWASP ZAP | |
-| SCA | Trivy + Snyk | |
-| シークレット検出 | gitleaks | |
-| 品質ダッシュボード | SonarQube | |
+| UIフレームワーク | React 19 + TypeScript | |
+| ビルドツール | Vite | 高速な開発サーバーとビルド |
+| パッケージマネージャ | pnpm | 高速・省スペース |
+| リンター | ESLint | TypeScript対応 |
+| フォーマッター | Prettier | |
+| テスト | vitest + @testing-library/react | |
+| PBT | fast-check | TypeScriptのPBTライブラリ |
+| カバレッジ | @vitest/coverage-v8 | |
+| APIクライアント型生成 | openapi-typescript | OpenAPIスキーマからTypeScript型を自動生成 |
+| バリデーション | Zod | ランタイムバリデーション + 型推論 |
 
 ---
 
@@ -288,40 +268,27 @@ Phase 2 の理論的背景は arXiv 2604.08224 *"Externalization in LLM Agents: 
 ### 構成方針
 
 ```
-docker-compose up -d     # CIインフラ起動（PostgreSQL, SonarQube, Grafana等）
+docker compose up -d     # CIインフラ起動（PostgreSQL, Grafana等）
 ./ci.sh                  # CI実行（マイグレーション・ビルド・テスト・解析を順次実行）
 ```
 
-### F# CI構成
+### CI構成
 
 ```
 docker-compose.yml
 ├── db               # PostgreSQL（常駐）
-├── grafana          # 品質ダッシュボード（常駐）
-└── ci.sh            # ワンショット実行
-    ├── dotnet run --project tools/Migrator   # DbUpマイグレーション適用
-    ├── dotnet build --warnaserror
-    ├── dotnet fantomas --check .
-    ├── dotnet tool run fsharplint lint src/
-    ├── scc --by-file --format json src/
-    ├── dotnet test --filter "Category=PBT" --collect:"XPlat Code Coverage"
-    ├── trivy fs --scanners vuln .
-    └── gitleaks detect
-```
+└── grafana          # 品質ダッシュボード（常駐）
 
-### Kotlin CI構成
-
-```
-docker-compose.yml
-├── db               # PostgreSQL（アプリ + SonarQube共用、常駐）
-├── sonarqube        # 品質ダッシュボード + SAST + 複雑度（常駐）
-└── ci.sh            # ワンショット実行
-    ├── gradle flywayMigrate              # Flywayマイグレーション適用
-    ├── gradle build
-    ├── gradle detekt
-    ├── gradle ktfmtCheck
-    ├── gradle test jacocoTestReport
-    ├── sonar-scanner（→ SonarQubeへ送信）
-    ├── trivy fs --scanners vuln .
-    └── gitleaks detect
+ci.sh                # ワンショット実行
+├── alembic upgrade head              # Alembicマイグレーション適用
+├── ruff format --check backend/      # フォーマットチェック（Python）
+├── ruff check backend/               # リンター（Python）
+├── pytest --cov=backend/src backend/ # テスト + カバレッジ（Python）
+├── npx prettier --check frontend/src/  # フォーマットチェック（TypeScript）
+├── npx eslint frontend/src/          # リンター（TypeScript）
+├── npx vitest run --coverage         # テスト + カバレッジ（TypeScript）
+├── bandit -r backend/src/            # SAST（Python）
+├── trivy fs --scanners vuln .        # SCA
+├── gitleaks detect                   # シークレット検出
+└── === verify (smoke) ===            # API起動してcurl検証
 ```

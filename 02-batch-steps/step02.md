@@ -4,7 +4,7 @@
 
 ### これは何か
 
-大量データを一定件数（チャンク）ずつ読み取り→加工→書き込みする `processInChunks` 関数を実装する。「月次締め処理」を題材に、在庫ロットの一括状態遷移をバッチで実行する。
+大量データを一定件数（チャンク）ずつ読み取り→加工→書き込みする `process_in_chunks` 関数を実装する。「月次締め処理」を題材に、在庫ロットの一括状態遷移をバッチで実行する。
 
 ### なぜやるのか
 
@@ -40,21 +40,17 @@ ON CONFLICT DO NOTHING;
 1. バッチを実行すると、1万件のロットが1000件ずつチャンク処理されること:
 
 ```bash
-# F#
-dotnet run --project tools/BatchRunner -- --job=monthly-close --date=2026-04
-
-# Kotlin
-gradle run --args="--job=monthly-close --date=2026-04"
+uv run python -m batch.runner --job=monthly-close --date=2026-04
 ```
 
 2. ログにチャンクごとの進捗が出力されること:
 
 ```
-{"message":"Chunk 1/10 completed","processed":1000,"elapsed":"120ms"}
-{"message":"Chunk 2/10 completed","processed":2000,"elapsed":"115ms"}
+{"event":"Chunk 1/10 completed","processed":1000,"elapsed_ms":120}
+{"event":"Chunk 2/10 completed","processed":2000,"elapsed_ms":115}
 ...
-{"message":"Chunk 10/10 completed","processed":10000,"elapsed":"110ms"}
-{"message":"Job completed","job":"monthly-close","totalProcessed":10000}
+{"event":"Chunk 10/10 completed","processed":10000,"elapsed_ms":110}
+{"event":"Job completed","job":"monthly-close","total_processed":10000}
 ```
 
 3. 全ロットの状態が更新されていること:
@@ -71,7 +67,7 @@ docker compose exec db psql -U app -d sales_management \
 
 - 最初はチャンクサイズを小さく（100件）して動作を確認し、その後1000件に増やす
 - 処理時間を計測して、チャンクサイズによる性能差を体感する
-- `processInChunks` 関数は汎用的に作る。月次締め固有のロジックは Reader / Processor / Writer に閉じ込める
+- `process_in_chunks` 関数は汎用的に作る。月次締め固有のロジックは Reader / Processor / Writer に閉じ込める
 
 ---
 
@@ -80,86 +76,130 @@ docker compose exec db psql -U app -d sales_management \
 ### 構造
 
 ```
-BatchRunner（エントリポイント）
-  └── processInChunks(reader, processor, writer, chunkSize)
-        ├── reader: DB から製造完了ロットを読み取る（WHERE id > lastId ORDER BY id LIMIT chunkSize）
+BatchRunner（エントリポイント: batch/runner.py）
+  └── process_in_chunks(reader, processor, writer, chunk_size)
+        ├── reader: DB から製造完了ロットを読み取る（WHERE id > last_id ORDER BY id LIMIT chunk_size）
         ├── processor: ドメインロジック適用（状態遷移）
         └── writer: DB に一括更新
 ```
 
-### F#
+### Python / SQLAlchemy
 
-```fsharp
-// 汎用チャンク処理関数
-let processInChunks
-    (db: NpgsqlDataSource) (chunkSize: int)
-    (reader: int64 -> 'a seq)
-    (processor: 'a -> Result<'b, 'err>)
-    (writer: NpgsqlConnection -> 'b list -> unit)
-    (getId: 'a -> int64) =
+```python
+# batch/chunk.py
+from collections.abc import AsyncGenerator, Callable
+from typing import TypeVar
 
-    let mutable lastId = 0L
-    let mutable chunkIndex = 0
-    let mutable hasMore = true
+import structlog
+from sqlalchemy.ext.asyncio import AsyncSession
 
-    while hasMore do
-        let chunk = reader lastId |> Seq.truncate chunkSize |> Seq.toArray
-        if Array.isEmpty chunk then
-            hasMore <- false
-        else
-            chunkIndex <- chunkIndex + 1
-            use conn = db.OpenConnection()
-            use tx = conn.BeginTransaction()
-            let results = chunk |> Array.choose (fun x -> processor x |> Result.toOption) |> Array.toList
-            writer conn results
-            lastId <- getId (Array.last chunk)
-            tx.Commit()
-            printfn $"Chunk {chunkIndex} completed: {results.Length} items"
+T = TypeVar("T")
+R = TypeVar("R")
 
-// 月次締めバッチ
-let monthlyClose (db: NpgsqlDataSource) (date: string) =
-    processInChunks db 1000
-        (fun lastId -> queryManufacturedLots db lastId 1000)
-        (fun lot -> instructShipping lot (DateOnly.Parse("2026-04-30")))
-        (fun conn lots -> bulkUpdateLots conn lots)
-        (fun lot -> lot.Id)
+logger = structlog.get_logger()
+
+
+async def process_in_chunks(
+    session: AsyncSession,
+    chunk_size: int,
+    reader: Callable[[int, int], AsyncGenerator[T, None]],
+    processor: Callable[[T], R | None],
+    writer: Callable[[AsyncSession, list[R]], None],
+    get_id: Callable[[T], int],
+) -> int:
+    last_id = 0
+    chunk_index = 0
+    total_processed = 0
+
+    while True:
+        chunk = [row async for row in reader(last_id, chunk_size)]
+        if not chunk:
+            break
+
+        chunk_index += 1
+        results = [r for item in chunk if (r := processor(item)) is not None]
+
+        async with session.begin():
+            await writer(session, results)
+
+        last_id = get_id(chunk[-1])
+        total_processed += len(results)
+        logger.info("chunk completed", chunk=chunk_index, processed=total_processed)
+
+    return total_processed
 ```
 
-### Kotlin
+```python
+# batch/jobs/monthly_close.py
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+from batch.chunk import process_in_chunks
 
-```kotlin
-fun <T, R> processInChunks(
-    db: Database, chunkSize: Int,
-    reader: (lastId: Long) -> List<T>,
-    processor: (T) -> Either<Any, R>,
-    writer: (List<R>) -> Unit,
-    getId: (T) -> Long,
-) {
-    var lastId = 0L
-    var chunkIndex = 0
 
-    while (true) {
-        val chunk = reader(lastId)
-        if (chunk.isEmpty()) break
+async def reader(session: AsyncSession, last_id: int, limit: int):
+    result = await session.execute(
+        text(
+            "SELECT id, lot_number, status FROM lot "
+            "WHERE status = 'manufactured' AND id > :last_id "
+            "ORDER BY id LIMIT :limit"
+        ),
+        {"last_id": last_id, "limit": limit},
+    )
+    for row in result:
+        yield row
 
-        chunkIndex++
-        transaction(db) {
-            val results = chunk.mapNotNull { processor(it).getOrNull() }
-            writer(results)
-            lastId = getId(chunk.last())
-        }
-        println("Chunk $chunkIndex completed: ${chunk.size} items")
-    }
-}
+
+async def writer(session: AsyncSession, lots: list) -> None:
+    for lot in lots:
+        await session.execute(
+            text("UPDATE lot SET status = 'shipping_instructed' WHERE id = :id"),
+            {"id": lot.id},
+        )
+
+
+async def run_monthly_close(session: AsyncSession, date_param: str) -> int:
+    return await process_in_chunks(
+        session=session,
+        chunk_size=1000,
+        reader=lambda last_id, limit: reader(session, last_id, limit),
+        processor=lambda row: row,
+        writer=writer,
+        get_id=lambda row: row.id,
+    )
 ```
 
 ### バッチ用エントリポイント
 
 API サーバーとは別に、コマンドライン引数でジョブを指定して実行するエントリポイントを作成する:
 
-```
-# F#: tools/BatchRunner/Program.fs
-# Kotlin: src/main/kotlin/salesmanagement/batch/BatchMain.kt
+```python
+# batch/runner.py
+import argparse
+import asyncio
+import sys
+
+from batch.database import AsyncSessionLocal
+from batch.jobs.monthly_close import run_monthly_close
+
+
+async def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--job", required=True)
+    parser.add_argument("--date", required=True)
+    args = parser.parse_args()
+
+    async with AsyncSessionLocal() as session:
+        if args.job == "monthly-close":
+            count = await run_monthly_close(session, args.date)
+            print(f"Completed: {count} records processed")
+            return 0
+        else:
+            print(f"Unknown job: {args.job}", file=sys.stderr)
+            return 1
+
+
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()))
 ```
 
 ---

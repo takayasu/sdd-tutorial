@@ -17,7 +17,7 @@
 - `awslocal logs` でバッチのログを検索できる。「昨日の月次締めバッチのエラーログだけ見たい」が1コマンドで実現する
 - メトリクスにより「先月と比べて処理件数が半分になっている」「実行時間が倍になっている」といった異常を検知できる
 - アラートにより、バッチ失敗時に自動で SQS に通知が送られる。人間が毎朝ログを確認する運用から脱却できる
-- これで Spring Batch が提供していた全機能の代替が完成する 🎉
+- これで Spring Batch が提供していた全機能の代替が完成する
 
 ## 完了条件
 
@@ -28,10 +28,10 @@
 1. バッチを実行し、完了時にメトリクスがログに出力されること:
 
 ```bash
-dotnet run --project tools/BatchRunner -- --job=monitoring-test --date=2026-04
+uv run python -m batch.runner --job=monitoring-test --date=2026-04
 
 # ログに以下のようなメトリクス情報が含まれること:
-# {"message":"Job completed","job":"monitoring-test","metrics":{"processedCount":10000,"executionTimeMs":15000,"skipCount":3,"errorCount":0}}
+# {"event":"Job completed","job":"monitoring-test","metrics":{"processed_count":10000,"execution_time_ms":15000,"skip_count":3,"error_count":0}}
 ```
 
 2. `batch_job_execution` テーブルに件数が正しく記録されていること:
@@ -87,7 +87,7 @@ awslocal cloudwatch describe-alarms --region ap-northeast-1
 ```bash
 REGION=ap-northeast-1
 
-dotnet run --project tools/BatchRunner -- --job=e2e-test --date=2026-04
+uv run python -m batch.runner --job=e2e-test --date=2026-04
 
 # CloudWatch Logs を検索
 awslocal logs filter-log-events \
@@ -109,7 +109,7 @@ awslocal cloudwatch list-metrics --namespace "BatchProcessing" --region $REGION 
 ```bash
 awslocal logs filter-log-events \
   --log-group-name /batch/sales-management \
-  --filter-pattern '{ $.level = "Error" }' \
+  --filter-pattern '{ $.level = "error" }' \
   --region $REGION
 ```
 
@@ -127,31 +127,62 @@ awslocal logs filter-log-events \
 
 ### アプリからの CloudWatch 連携
 
-バッチの `runBatch` 関数の完了時に、CloudWatch Logs と Metrics にデータを送信する:
+バッチの `run_batch` 関数の完了時に、CloudWatch Logs と Metrics にデータを送信する:
 
 ```
-runBatch 完了時:
+run_batch 完了時:
   1. batch_job_execution に記録（既存、Step 3）
   2. CloudWatch Logs にログ送信（新規）
   3. CloudWatch Metrics にメトリクス送信（新規）
 ```
 
-### F#
+### Python / boto3
 
-```fsharp
-// AWS SDK for .NET
-// NuGet: AWSSDK.CloudWatchLogs, AWSSDK.CloudWatch
-let cloudWatchConfig = AmazonCloudWatchConfig(ServiceURL = "http://localhost:4566")
-let logsConfig = AmazonCloudWatchLogsConfig(ServiceURL = "http://localhost:4566")
+```bash
+uv add boto3
 ```
 
-### Kotlin
+```python
+# batch/cloudwatch.py
+import os
+from datetime import datetime, timezone
 
-```kotlin
-// AWS SDK for Kotlin / Java
-// Gradle: implementation("aws.sdk.kotlin:cloudwatch"), implementation("aws.sdk.kotlin:cloudwatchlogs")
-val cloudWatch = CloudWatchClient { region = "ap-northeast-1"; endpointUrl = Url.parse("http://localhost:4566") }
-val logsClient = CloudWatchLogsClient { region = "ap-northeast-1"; endpointUrl = Url.parse("http://localhost:4566") }
+import boto3
+
+_endpoint = os.environ.get("AWS_ENDPOINT_URL", "http://localhost:4566")
+_region = os.environ.get("AWS_DEFAULT_REGION", "ap-northeast-1")
+
+_logs = boto3.client("logs", endpoint_url=_endpoint, region_name=_region)
+_cw = boto3.client("cloudwatch", endpoint_url=_endpoint, region_name=_region)
+
+LOG_GROUP = "/batch/sales-management"
+
+
+def put_metrics(job_name: str, processed: int, elapsed_ms: int, skipped: int, errors: int) -> None:
+    now = datetime.now(timezone.utc)
+    _cw.put_metric_data(
+        Namespace="BatchProcessing",
+        MetricData=[
+            {"MetricName": "ProcessedCount", "Value": processed, "Unit": "Count", "Timestamp": now},
+            {"MetricName": "ExecutionTime", "Value": elapsed_ms, "Unit": "Milliseconds", "Timestamp": now},
+            {"MetricName": "SkipCount", "Value": skipped, "Unit": "Count", "Timestamp": now},
+            {"MetricName": "ErrorCount", "Value": errors, "Unit": "Count", "Timestamp": now},
+        ],
+    )
+
+
+def put_log(job_name: str, message: str) -> None:
+    log_stream = job_name
+    try:
+        _logs.create_log_stream(logGroupName=LOG_GROUP, logStreamName=log_stream)
+    except _logs.exceptions.ResourceAlreadyExistsException:
+        pass
+
+    _logs.put_log_events(
+        logGroupName=LOG_GROUP,
+        logStreamName=log_stream,
+        logEvents=[{"timestamp": int(datetime.now(timezone.utc).timestamp() * 1000), "message": message}],
+    )
 ```
 
 ### LocalStack 初期化スクリプトの最終版
@@ -207,19 +238,19 @@ echo "=== LocalStack setup complete ==="
 
 ---
 
-## 🎉 おめでとうございます！
+## おめでとうございます！
 
 Step 8が完了すると、Spring Batch の全機能を代替するバッチ処理基盤が完成します:
 
 | Spring Batch 機能 | 実装済み | 出典 |
 |---|---|---|
-| チャンク処理（Reader → Processor → Writer） | `processInChunks` 関数 | Step 2 |
-| ジョブ実行管理 | `batch_job_execution` テーブル + `tryStart` | Step 3 |
+| チャンク処理（Reader → Processor → Writer） | `process_in_chunks` 関数 | Step 2 |
+| ジョブ実行管理 | `batch_job_execution` テーブル + `try_start` | Step 3 |
 | 二重実行防止 | DB PK 制約 + ステータスチェック | Step 3 |
-| チャンクリスタート | `batch_chunk_progress` テーブル + `upsertProgress` | Step 4 |
-| スキップ/リトライ | `ChunkConfig` + `processItemWithRetry` | Step 5 |
-| リスナー/フック | `BatchListeners` 高階関数 | Step 5 |
-| 並列処理（パーティショニング） | `Async.Parallel` / `coroutineScope` | Step 6 |
+| チャンクリスタート | `batch_chunk_progress` テーブル + `upsert_progress` | Step 4 |
+| スキップ/リトライ | `ChunkConfig` + `process_item_with_retry` | Step 5 |
+| リスナー/フック | `BatchListeners` dataclass | Step 5 |
+| 並列処理（パーティショニング） | `asyncio.gather` | Step 6 |
 | スケジューリング | EventBridge Scheduler (LocalStack) | Step 7 |
 | ジョブ起動・通知 | Step Functions (LocalStack) | Step 7 |
 | 監視・アラート | CloudWatch Logs + Metrics (LocalStack) | Step 8 |
@@ -229,7 +260,7 @@ Step 8が完了すると、Spring Batch の全機能を代替するバッチ処�
 ```
 アプリ側（自己完結・クラウド非依存）:
   ✅ チャンク処理、リスタート、二重実行防止、スキップ/リトライ、並列処理
-  → DB ライブラリのみに依存。外部ライブラリ追加なし。
+  → SQLAlchemy asyncio のみに依存。外部ライブラリ追加なし。
 
 クラウド側（薄い・差し替え可能）:
   ✅ スケジューリング、ジョブ起動、監視・通知

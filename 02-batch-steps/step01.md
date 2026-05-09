@@ -84,8 +84,7 @@ awslocal sqs list-queues --region ap-northeast-1
 Spring Batch のメタデータ5テーブルを2テーブルに簡素化する:
 
 ```sql
--- F#: migrations/00X__create_batch_tables.sql
--- Kotlin: src/main/resources/db/migration/V00X__create_batch_tables.sql
+-- migrations/versions/XXXX_create_batch_tables.sql (Alembic で管理)
 
 -- ジョブ実行管理（Spring Batch の JOB_INSTANCE + JOB_EXECUTION に相当）
 CREATE TABLE batch_job_execution (
@@ -117,11 +116,7 @@ CREATE TABLE batch_chunk_progress (
 ### マイグレーション実行
 
 ```bash
-# F#
-dotnet run --project tools/Migrator
-
-# Kotlin
-gradle flywayMigrate
+uv run alembic upgrade head
 ```
 
 ## 完了条件の確認方針

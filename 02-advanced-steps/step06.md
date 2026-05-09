@@ -99,12 +99,6 @@ docker compose up -d wiremock
 # 動作確認
 curl http://localhost:8181/api/pricing/lot-001
 # → {"basePrice":10000,"adjustmentRate":1.05,"source":"external-pricing-api"}
-
-curl http://localhost:8181/api/pricing/error/lot-001
-# → 500 Internal Server Error
-
-curl http://localhost:8181/api/pricing/slow/lot-001
-# → 5秒後に応答
 ```
 
 ## 完了条件
@@ -117,17 +111,16 @@ curl http://localhost:8181/api/pricing/slow/lot-001
 TOKEN=$(./scripts/get-token.sh test-operator)
 
 curl -H "Authorization: Bearer $TOKEN" \
-  "http://localhost:8080/api/external/price-check?lotId=2024-A-001"
+  "http://localhost:8000/external/price-check?lot_id=2024-A-001"
 # → 200 OK
 # {"basePrice":10000,"adjustmentRate":1.05,"source":"external-pricing-api"}
 ```
 
 ### リトライの確認
 
-2. WireMock の Scenario 機能を使い、「1回目は500、2回目は200」を再現する。WireMock の管理APIでシナリオを動的に設定できる:
+2. WireMock の Scenario 機能を使い、「1回目は500、2回目は200」を再現する:
 
 ```bash
-# WireMock のシナリオ設定（1回目→500, 2回目→200）
 curl -X POST http://localhost:8181/__admin/mappings -H "Content-Type: application/json" -d '{
   "scenarioName": "retry-test",
   "requiredScenarioState": "Started",
@@ -143,17 +136,16 @@ curl -X POST http://localhost:8181/__admin/mappings -H "Content-Type: applicatio
   "response": { "status": 200, "jsonBody": { "basePrice": 10000 } }
 }'
 
-# アプリ経由で呼び出し → リトライにより成功
 curl -H "Authorization: Bearer $TOKEN" \
-  "http://localhost:8080/api/external/price-check?lotId=retry-test"
+  "http://localhost:8000/external/price-check?lot_id=retry-test"
 # → 200 OK（リトライにより成功）
 ```
 
 3. ログにリトライの記録が出力されていること:
 
 ```
-{"level":"Warning","message":"Retry attempt 1 for external-pricing-api","statusCode":500}
-{"level":"Information","message":"external-pricing-api succeeded after 1 retry"}
+{"level":"warning","event":"retry attempt","attempt":1,"status_code":500,"service":"external-pricing-api"}
+{"level":"info","event":"retry succeeded","attempt":2,"service":"external-pricing-api"}
 ```
 
 ### タイムアウトの確認
@@ -162,9 +154,9 @@ curl -H "Authorization: Bearer $TOKEN" \
 
 ```bash
 curl -H "Authorization: Bearer $TOKEN" \
-  "http://localhost:8080/api/external/price-check?lotId=slow/lot-001"
+  "http://localhost:8000/external/price-check?lot_id=slow/lot-001"
 # → 502 Bad Gateway（タイムアウト）
-# {"type":"external-service-error","detail":"Request timed out after 3000ms"}
+# {"type":"external-service-error","detail":"Request timed out after 3s"}
 ```
 
 ### サーキットブレーカーの確認
@@ -172,48 +164,118 @@ curl -H "Authorization: Bearer $TOKEN" \
 5. エラースタブに対して連続でリクエストを送り、サーキットブレーカーが開くこと:
 
 ```bash
-# 5回連続でエラーを発生させる
 for i in $(seq 1 5); do
   curl -s -o /dev/null -w "Request $i: %{http_code}\n" \
     -H "Authorization: Bearer $TOKEN" \
-    "http://localhost:8080/api/external/price-check?lotId=error/lot-001"
+    "http://localhost:8000/external/price-check?lot_id=error/lot-001"
 done
 
-# 6回目以降はサーキットブレーカーが開き、WireMock にリクエストを送らずに即座にエラーを返す
+# 6回目以降は即座に503が返る
 curl -H "Authorization: Bearer $TOKEN" \
-  "http://localhost:8080/api/external/price-check?lotId=error/lot-001"
+  "http://localhost:8000/external/price-check?lot_id=error/lot-001"
 # → 503 Service Unavailable（即座に返る）
-# ログ: {"level":"Warning","message":"Circuit breaker OPEN for external-pricing-api"}
 ```
 
 ### 確認のコツ
 
-- WireMock の管理API `http://localhost:8181/__admin/requests` で、WireMock が受け取ったリクエストの履歴を確認できる。サーキットブレーカーが開いた後はリクエスト数が増えないことを確認する
+- WireMock の管理API `http://localhost:8181/__admin/requests` で受け取ったリクエストの履歴を確認できる
 - テスト後は `curl -X POST http://localhost:8181/__admin/scenarios/reset` でシナリオをリセットする
 
 ---
 
 ## 実装ガイド
 
-### F#
+### Python / FastAPI (Backend)
 
 | 要素 | 実装方法 |
 |---|---|
-| HTTPクライアント | `IHttpClientFactory` + `System.Net.Http.HttpClient` |
-| リトライ | Polly `WaitAndRetryAsync`（指数バックオフ） |
-| サーキットブレーカー | Polly `CircuitBreakerAsync` |
-| タイムアウト | `HttpClient.Timeout` |
-| WireMock URL | `appsettings.json` の `ExternalApi.PricingUrl` で設定 |
+| HTTPクライアント | `httpx.AsyncClient`（非同期） |
+| リトライ | `tenacity` `AsyncRetrying`（指数バックオフ） |
+| サーキットブレーカー | `circuitbreaker` ライブラリ |
+| タイムアウト | `httpx.Timeout` |
+| WireMock URL | `.env` の `PRICING_API_URL` で設定 |
 
-### Kotlin
+#### 依存パッケージ追加
 
-| 要素 | 実装方法 |
-|---|---|
-| HTTPクライアント | Ktor Client (`ktor-client-cio`) |
-| リトライ | Ktor `HttpRequestRetry` plugin |
-| サーキットブレーカー | Resilience4j `CircuitBreaker` |
-| タイムアウト | Ktor `HttpTimeout` plugin |
-| WireMock URL | `application.conf` の `externalApi.pricingUrl` で設定 |
+```bash
+cd backend
+uv add httpx tenacity circuitbreaker
+```
+
+#### `backend/src/clients/pricing_client.py`
+
+```python
+import os
+import structlog
+import httpx
+from tenacity import AsyncRetrying, stop_after_attempt, wait_exponential, retry_if_exception
+from circuitbreaker import circuit
+
+logger = structlog.get_logger()
+
+PRICING_API_URL = os.environ.get("PRICING_API_URL", "http://localhost:8181")
+_TIMEOUT = httpx.Timeout(3.0)
+
+
+def _is_server_error(exc: BaseException) -> bool:
+    return isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code >= 500
+
+
+@circuit(failure_threshold=5, recovery_timeout=30, name="external-pricing-api")
+async def _fetch_price_raw(lot_id: str) -> dict:
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.get(f"{PRICING_API_URL}/api/pricing/{lot_id}")
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def fetch_price(lot_id: str) -> dict:
+    attempt = 0
+    async for attempt_ctx in AsyncRetrying(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=0.5, min=0.5, max=4),
+        retry=retry_if_exception(_is_server_error),
+        reraise=True,
+    ):
+        with attempt_ctx:
+            attempt += 1
+            if attempt > 1:
+                logger.warning(
+                    "retry attempt",
+                    attempt=attempt,
+                    service="external-pricing-api",
+                )
+            result = await _fetch_price_raw(lot_id)
+    return result
+```
+
+#### `backend/src/routers/external.py`
+
+```python
+from fastapi import APIRouter, Depends, HTTPException
+from circuitbreaker import CircuitBreakerError
+
+from src.clients.pricing_client import fetch_price
+from src.middleware.auth import require_auth
+
+router = APIRouter(prefix="/external")
+
+
+@router.get("/price-check")
+async def price_check(lot_id: str, claims: dict = Depends(require_auth)) -> dict:
+    try:
+        return await fetch_price(lot_id)
+    except CircuitBreakerError:
+        raise HTTPException(status_code=503, detail="External pricing service unavailable")
+    except Exception:
+        raise HTTPException(status_code=502, detail="External service error")
+```
+
+#### `.env` への追記
+
+```ini
+PRICING_API_URL=http://localhost:8181
+```
 
 ---
 

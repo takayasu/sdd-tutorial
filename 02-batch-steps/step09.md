@@ -4,17 +4,17 @@
 
 ### これは何か
 
-CSV ファイルからデータを読み取り、行ごとにバリデーションしてDBに一括登録するバッチジョブを実装する。Step 2-6 で構築した `processInChunks` インフラを、ファイルベースの Reader で使う。
+CSV ファイルからデータを読み取り、行ごとにバリデーションしてDBに一括登録するバッチジョブを実装する。Step 2-6 で構築した `process_in_chunks` インフラを、ファイルベースの Reader で使う。
 
 ### なぜやるのか
 
 - Step 2-8 のバッチは全て DB→DB 処理だった。業務システムでは「外部システムから受け取った CSV をインポートする」パターンが非常に多い
-- Spring Batch の `FlatFileItemReader` に相当する機能を、言語標準のファイル読み取り + `processInChunks` で実現する
+- Spring Batch の `FlatFileItemReader` に相当する機能を、Python 標準の `csv` モジュール + `process_in_chunks` で実現する
 - 行ごとのバリデーションエラーを蓄積し、「100行中3行がエラー、97行が正常登録」という結果を返す
 
 ### 何がうれしいのか
 
-- `processInChunks` の Reader を差し替えるだけで、DB→DB バッチと同じインフラ（リスタート、スキップ、リスナー）がファイルバッチにも使える
+- `process_in_chunks` の Reader を差し替えるだけで、DB→DB バッチと同じインフラ（リスタート、スキップ、リスナー）がファイルバッチにも使える
 - バリデーションエラーの行番号と内容がログに記録されるため、データ提供元にフィードバックできる
 - 大量の CSV（数万行）でもチャンク単位でコミットするため、途中で失敗しても処理済み分は確定される
 
@@ -43,9 +43,7 @@ mkdir -p data
 1. CSV インポートバッチを実行し、正常行がDBに登録されること:
 
 ```bash
-dotnet run --project tools/BatchRunner -- --job=import-lots --file=data/import_lots.csv
-# or
-gradle run --args="--job=import-lots --file=data/import_lots.csv"
+uv run python -m batch.runner --job=import-lots --file=data/import_lots.csv
 ```
 
 2. `batch_job_execution` に結果が記録されること:
@@ -67,7 +65,7 @@ docker compose exec db psql -U app -d sales_management \
 4. スキップされた行がログに記録されていること:
 
 ```
-{"level":"Warning","message":"Row skipped","line":4,"reason":"lot_number_seq must be a positive integer","raw":"2026,C,invalid,1,1,1,1,1,1"}
+{"level":"warning","event":"Row skipped","line":4,"reason":"lot_number_seq must be a positive integer","raw":"2026,C,invalid,1,1,1,1,1,1"}
 ```
 
 5. エンコーディングが Windows-31J の CSV でも正しく読み取れること:
@@ -76,7 +74,7 @@ docker compose exec db psql -U app -d sales_management \
 # Windows-31J の CSV を作成
 nkf -s data/import_lots.csv > data/import_lots_sjis.csv
 
-dotnet run --project tools/BatchRunner -- --job=import-lots --file=data/import_lots_sjis.csv --encoding=windows-31j
+uv run python -m batch.runner --job=import-lots --file=data/import_lots_sjis.csv --encoding=windows-31j
 # → 正常に処理される
 ```
 
@@ -90,7 +88,7 @@ for i in range(1, 10001):
     print(f'2026,D,{i},1,1,1,1,1,1')
 " > data/import_lots_large.csv
 
-dotnet run --project tools/BatchRunner -- --job=import-lots-large --file=data/import_lots_large.csv
+uv run python -m batch.runner --job=import-lots-large --file=data/import_lots_large.csv
 # → チャンクごとにログが出力される
 # → batch_job_execution.write_count = 10000
 ```
@@ -102,66 +100,134 @@ dotnet run --project tools/BatchRunner -- --job=import-lots-large --file=data/im
 ### 構造
 
 ```
-processInChunks(
-  reader:    CSVファイルから行を読み取り、パース済みオブジェクトの Seq/Sequence を返す
+process_in_chunks(
+  reader:    CSV ファイルから行を読み取り、パース済みオブジェクトを yield するジェネレータ
   processor: 行ごとのバリデーション（Smart Constructor）
   writer:    DB に一括 INSERT
 )
 ```
 
-### F#
+### Python / SQLAlchemy
 
 | 要素 | 実装方法 |
 |---|---|
-| CSV 読み取り | `CsvHelper`（NuGet）の `CsvReader` — ストリーミング読み取り |
-| エンコーディング | `Encoding.GetEncoding("windows-31j")` |
-| バリデーション | Smart Constructor（Step 2 で作成済み） |
-| DB 書き込み | Donald `Db.exec` + バッチ INSERT |
+| CSV 読み取り | Python 標準 `csv` モジュール — ストリーミング読み取り |
+| エンコーディング | `open(file, encoding="cp932")` — Windows-31J（CP932） |
+| バリデーション | Smart Constructor パターン（Step 2 で作成済み） |
+| DB 書き込み | SQLAlchemy `text()` + バッチ INSERT |
 
-```fsharp
-// Reader: CSV → LotImportRow seq
-let csvReader (filePath: string) (encoding: Encoding) (lastId: int64) : LotImportRow seq =
-    seq {
-        use reader = new StreamReader(filePath, encoding)
-        use csv = new CsvReader(reader, CultureInfo.InvariantCulture)
-        let mutable lineNo = 0L
-        while csv.Read() do
-            lineNo <- lineNo + 1L
-            if lineNo > lastId then
-                yield csv.GetRecord<LotImportRow>() |> withLineNumber lineNo
-    }
-```
+```python
+# batch/jobs/import_lots.py
+import csv
+from dataclasses import dataclass
 
-### Kotlin
+import structlog
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
-| 要素 | 実装方法 |
-|---|---|
-| CSV 読み取り | Jackson CSV (`jackson-dataformat-csv`) |
-| エンコーディング | `Charset.forName("windows-31j")` |
-| バリデーション | Arrow `Either` + Smart Constructor |
-| DB 書き込み | Exposed `batchInsert` |
+logger = structlog.get_logger()
 
-```kotlin
-// Reader: CSV → Sequence<LotImportRow>
-fun csvReader(filePath: String, charset: Charset, lastId: Long): Sequence<LotImportRow> {
-    val csvMapper = CsvMapper().apply { registerModule(KotlinModule.Builder().build()) }
-    val schema = csvMapper.schemaFor(LotImportRow::class.java).withHeader()
-    return csvMapper.readerFor(LotImportRow::class.java)
-        .with(schema)
-        .readValues<LotImportRow>(File(filePath).reader(charset))
-        .asSequence()
-        .withIndex()
-        .filter { it.index + 1 > lastId }
-        .map { it.value.copy(lineNumber = it.index + 1L) }
-}
+
+@dataclass
+class LotImportRow:
+    line_number: int
+    lot_number_year: int
+    lot_number_location: str
+    lot_number_seq: int
+    division_code: int
+    department_code: int
+    section_code: int
+    process_category: int
+    inspection_category: int
+    manufacturing_category: int
+
+
+def parse_row(line_number: int, raw: dict) -> LotImportRow:
+    try:
+        return LotImportRow(
+            line_number=line_number,
+            lot_number_year=int(raw["ロット番号年度"]),
+            lot_number_location=raw["ロット番号保管場所"],
+            lot_number_seq=int(raw["ロット番号連番"]),
+            division_code=int(raw["事業部コード"]),
+            department_code=int(raw["部門コード"]),
+            section_code=int(raw["担当課コード"]),
+            process_category=int(raw["工程区分"]),
+            inspection_category=int(raw["検査区分"]),
+            manufacturing_category=int(raw["製造区分"]),
+        )
+    except (ValueError, KeyError) as exc:
+        raise ValueError(f"Parse error: {exc}") from exc
+
+
+async def csv_reader(file_path: str, encoding: str, last_id: int, limit: int):
+    with open(file_path, encoding=encoding, newline="") as f:
+        reader = csv.DictReader(f)
+        line_number = 0
+        count = 0
+        for raw in reader:
+            line_number += 1
+            if line_number <= last_id:
+                continue
+            if count >= limit:
+                break
+            yield (line_number, raw)
+            count += 1
+
+
+async def writer(session: AsyncSession, rows: list[LotImportRow]) -> None:
+    for row in rows:
+        await session.execute(
+            text(
+                "INSERT INTO lot (lot_number_year, lot_number_location, lot_number_seq, "
+                "division_code, department_code, section_code, "
+                "process_category, inspection_category, manufacturing_category, status) "
+                "VALUES (:year, :loc, :seq, :div, :dept, :sec, :proc, :insp, :mfg, 'manufacturing') "
+                "ON CONFLICT DO NOTHING"
+            ),
+            {
+                "year": row.lot_number_year, "loc": row.lot_number_location,
+                "seq": row.lot_number_seq, "div": row.division_code,
+                "dept": row.department_code, "sec": row.section_code,
+                "proc": row.process_category, "insp": row.inspection_category,
+                "mfg": row.manufacturing_category,
+            },
+        )
+
+
+async def run_import_lots(
+    session: AsyncSession, file_path: str, encoding: str = "utf-8"
+) -> tuple[int, int]:
+    from batch.chunk import process_in_chunks
+    from batch.chunk_config import ChunkConfig
+
+    def processor(item: tuple[int, dict]) -> LotImportRow | None:
+        line_number, raw = item
+        try:
+            return parse_row(line_number, raw)
+        except ValueError as exc:
+            logger.warning("row skipped", line=line_number, reason=str(exc), raw=str(raw))
+            return None
+
+    cfg = ChunkConfig(max_skips=100, is_skippable=lambda exc: isinstance(exc, ValueError))
+
+    return await process_in_chunks(
+        session=session,
+        chunk_size=1000,
+        reader=lambda last_id, limit: csv_reader(file_path, encoding, last_id, limit),
+        processor=processor,
+        writer=writer,
+        get_id=lambda item: item[0],
+        config=cfg,
+    )
 ```
 
 ### リスタートとの組み合わせ
 
-CSV インポートのリスタートは「行番号」をオフセットとして使う。`batch_chunk_progress.last_processed_id` に最後に処理した行番号を記録し、再実行時はその行番号以降から読み取る。
+CSV インポートのリスタートは「行番号」をオフセットとして使う。`batch_chunk_progress.last_processed_id` に最後に処理した行番号を記録し、再実行時はその行番号以降から読み取る。`csv_reader` の `last_id` 引数がそのオフセットに対応する。
 
 ---
 
-## 🎉 バッチ処理基盤の完成
+## バッチ処理基盤の完成
 
-Step 9 が完了すると、DB→DB バッチ（Step 2-8）に加えて、ファイル→DB バッチも動作する状態になります。`processInChunks` の Reader を差し替えるだけで、リスタート・スキップ・リスナー・並列処理の全てが使い回せることが確認できました。
+Step 9 が完了すると、DB→DB バッチ（Step 2-8）に加えて、ファイル→DB バッチも動作する状態になります。`process_in_chunks` の Reader を差し替えるだけで、リスタート・スキップ・リスナー・並列処理の全てが使い回せることが確認できました。

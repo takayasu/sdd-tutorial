@@ -34,7 +34,7 @@ docker compose exec db psql -U app -d sales_management \
       SELECT 2026, 'B', seq, 1, 1, 1, 1, 1, 1, 'manufactured', '2026-04-01'
       FROM generate_series(1, 10000) AS seq ON CONFLICT DO NOTHING;"
 
-# 5000件目で失敗するように仕込む（例: 5000件目のロットに不正データを設定）
+# 5000件目で失敗するように仕込む
 docker compose exec db psql -U app -d sales_management \
   -c "UPDATE lot SET status = 'invalid_status' WHERE lot_number_year = 2026 AND lot_number_location = 'B' AND lot_number_seq = 5000;"
 ```
@@ -42,7 +42,7 @@ docker compose exec db psql -U app -d sales_management \
 2. バッチを実行すると、5000件目付近で失敗すること:
 
 ```bash
-dotnet run --project tools/BatchRunner -- --job=restart-test --date=2026-04
+uv run python -m batch.runner --job=restart-test --date=2026-04
 # → エラー発生、status = FAILED
 ```
 
@@ -62,16 +62,16 @@ docker compose exec db psql -U app -d sales_management \
   -c "UPDATE lot SET status = 'manufactured' WHERE lot_number_year = 2026 AND lot_number_location = 'B' AND lot_number_seq = 5000;"
 
 # 再実行
-dotnet run --project tools/BatchRunner -- --job=restart-test --date=2026-04
+uv run python -m batch.runner --job=restart-test --date=2026-04
 ```
 
 5. ログで再開位置が確認できること:
 
 ```
-{"message":"Restarting from last_processed_id=4000"}
-{"message":"Chunk 1 completed","processed":5000,"startedFrom":4001}
+{"event":"Restarting from last_processed_id","last_processed_id":4000}
+{"event":"Chunk 1 completed","processed":5000,"started_from":4001}
 ...
-{"message":"Job completed","totalProcessed":10000}
+{"event":"Job completed","total_processed":10000}
 ```
 
 6. 完了後、`batch_chunk_progress` のレコードが削除されていること（完了したジョブの進捗は不要）:
@@ -95,13 +95,13 @@ docker compose exec db psql -U app -d sales_management \
 
 - チャンクサイズを小さく（100件）して、リスタートの動作を細かく観察する
 - `batch_chunk_progress` テーブルを処理中に SELECT して、チャンクごとに `last_processed_id` が更新されることを確認する
-- Reader の SQL は `WHERE id > @lastId ORDER BY id LIMIT @chunkSize` の形にする。これにより、`lastId` を渡すだけでリスタート位置から読み取れる
+- Reader の SQL は `WHERE id > :last_id ORDER BY id LIMIT :chunk_size` の形にする。これにより、`last_id` を渡すだけでリスタート位置から読み取れる
 
 ---
 
 ## 実装ガイド
 
-### processInChunks の変更点（Step 2 からの差分）
+### process_in_chunks の変更点（Step 2 からの差分）
 
 ```
 Before（Step 2）:
@@ -109,19 +109,70 @@ Before（Step 2）:
     Read → Process → Write → COMMIT
 
 After（Step 4）:
-  起動時: getLastProcessedId() → offset 取得
+  起動時: get_last_processed_id() → offset 取得
   チャンクループ:
-    Read(offset以降) → Process → Write → upsertProgress() → COMMIT（同一TX）
-  完了時: deleteProgress()
+    Read(offset以降) → Process → Write → upsert_progress() → COMMIT（同一TX）
+  完了時: delete_progress()
 ```
 
-### upsertProgress
+### Python / SQLAlchemy での実装
 
-業務データの Write と同一トランザクション内で `batch_chunk_progress` を UPSERT する。`ON CONFLICT ... DO UPDATE` で冪等に。
+```python
+# batch/chunk_progress.py
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
-### getLastProcessedId
 
-`tryStart` が `Restarting` を返した場合に呼び出し、前回の中断位置を取得する。
+async def get_last_processed_id(
+    session: AsyncSession, job_name: str, job_params: str, partition_id: int = 0
+) -> int:
+    result = await session.execute(
+        text(
+            "SELECT last_processed_id FROM batch_chunk_progress "
+            "WHERE job_name = :name AND job_params = :params AND partition_id = :pid"
+        ),
+        {"name": job_name, "params": job_params, "pid": partition_id},
+    )
+    row = result.fetchone()
+    return row.last_processed_id if row else 0
+
+
+async def upsert_progress(
+    session: AsyncSession,
+    job_name: str,
+    job_params: str,
+    partition_id: int,
+    last_processed_id: int,
+    processed_count: int,
+) -> None:
+    await session.execute(
+        text(
+            "INSERT INTO batch_chunk_progress "
+            "(job_name, job_params, partition_id, last_processed_id, processed_count) "
+            "VALUES (:name, :params, :pid, :last_id, :count) "
+            "ON CONFLICT (job_name, job_params, partition_id) DO UPDATE "
+            "SET last_processed_id = :last_id, processed_count = :count, updated_at = NOW()"
+        ),
+        {
+            "name": job_name, "params": job_params, "pid": partition_id,
+            "last_id": last_processed_id, "count": processed_count,
+        },
+    )
+
+
+async def delete_progress(
+    session: AsyncSession, job_name: str, job_params: str
+) -> None:
+    await session.execute(
+        text("DELETE FROM batch_chunk_progress WHERE job_name = :name AND job_params = :params"),
+        {"name": job_name, "params": job_params},
+    )
+    await session.commit()
+```
+
+### upsert_progress の呼び出しタイミング
+
+業務データの Write と同一トランザクション内で `batch_chunk_progress` を UPSERT する。`ON CONFLICT ... DO UPDATE` で冪等に。`process_in_chunks` の `writer` コールバックと同じトランザクション内で呼び出すよう `process_in_chunks` を拡張する。
 
 ---
 

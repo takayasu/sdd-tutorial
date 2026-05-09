@@ -4,168 +4,330 @@
 
 ### これは何か
 
-domain-model-section3.md のDSLをAI（Kiro CLI）で型定義に変換する。予約販売案件・委託販売案件・品目変換を追加し、販売案件の全種別（直接/予約/委託）を統合した型を定義する。
+`domain-model-section3.md` の DSL を Python frozen dataclass と TypeScript discriminated union に変換する。予約販売案件・委託販売案件を追加し、販売案件の全種別（直接/予約/委託）を統合した型を定義する。
 
 ### なぜやるのか
 
 - 販売案件には3種類（直接/予約/委託）があり、それぞれ全く異なるライフサイクルを持つ
 - 「予約販売案件に販売契約を締結する」といった業務上ありえない操作を、型レベルで不可能にする
-- 全ステップ完了後、元のdomain-model-sales-management.mdと同一のドメインモデルになる
+- 全ステップ完了後、元の `domain-model-sales-management.md` と同一のドメインモデルになる
 
 ### 何がうれしいのか
 
-- 3種類の販売案件を1つの `SalesCase` 型で統合することで、「どの種類の案件か」を型で判別できる
-- 種類ごとに許可される操作が異なることが、コードの構造から明らか
-- ドメインモデル全体が完成し、実業務の全体像がコードで表現される
+- 3種類の販売案件を1つの `SalesCase` Union 型で統合することで、「どの種類の案件か」を型で判別できる
+- `match case:` / `switch (case.status)` で全種別を網羅しないと型エラーになる
 
 ## 完了条件
 
-### F#
-
 ```bash
-$ cd ../sales-management/apps/api-fsharp
-$ dotnet build
-  Build succeeded.
-      0 Warning(s)
-      0 Error(s)
+# Python: 型チェック通過
+$ cd backend && mypy src/domain/reservation_case.py src/domain/consignment_case.py --strict
+Success: no issues found in 2 source files
 
-# 既存のPBTが引き続き通ること
-$ dotnet test --filter "Category=PBT"
-  Passed!  - Failed:     0, Passed:    10, Skipped:     0, Total:    10
-```
-
-### Kotlin
-
-```bash
-$ cd kotlin
-$ gradle build
-BUILD SUCCESSFUL in Xs
-
-# 既存のPBTが引き続き通ること
-$ gradle test --tests "*PropertyTest*"
-BUILD SUCCESSFUL in Xs
-10 tests completed, 0 failed
+# TypeScript: 型チェック通過
+$ cd frontend && npx tsc --noEmit
+（エラーなし）
 ```
 
 ---
 
-## Kiro CLIでの変換
+## Python 型定義
 
-domain-model-section3.md をコンテキストとして渡し、型定義を生成する。
+### src/domain/reservation_case.py
 
----
+```python
+from __future__ import annotations
 
-## F# 期待される型定義の構造
+from dataclasses import dataclass
+from datetime import date
+from typing import Literal
 
-```fsharp
-// Domain/ReservationCaseTypes.fs
-module SalesManagement.Domain.ReservationCaseTypes
+from src.domain.sales_case import SalesCaseCommon
 
-// 予約価格
-type ReservationPriceCommon = {
-    AppraisalNumber: AppraisalNumber
-    AppraisalDate: DateOnly
-    EstimatedLotInfo: string
-    EstimatedAmount: Amount
-}
 
-type UndeterminedReservationPrice = { Common: ReservationPriceCommon }
-type DeterminedReservationPrice = {
-    Common: ReservationPriceCommon
-    DeterminedDate: DateOnly
-    DeterminedAmount: Amount
-}
+# ---------- 予約価格 ----------
 
-type EstimatePriceAppraisal =
-    | Undetermined of UndeterminedReservationPrice
-    | Determined of DeterminedReservationPrice
+@dataclass(frozen=True)
+class ReservationPriceCommon:
+    appraisal_number_year: int
+    appraisal_number_month: int
+    appraisal_number_seq: int
+    appraisal_date: date
+    estimated_lot_info: str
+    estimated_amount: int
 
-// 予約販売案件
-type BeforeReservationPriceCase = { Common: SalesCaseCommon }
-type EstimateAppraisedCase = { Common: SalesCaseCommon; Appraisal: EstimatePriceAppraisal }
-type EstimateDeterminedCase = { Common: SalesCaseCommon; Appraisal: EstimatePriceAppraisal; DeterminedDate: DateOnly }
-type EstimateDeliveredCase = { Common: SalesCaseCommon; Appraisal: EstimatePriceAppraisal; DeterminedDate: DateOnly; DeliveryDate: DateOnly }
 
-type ReservationSalesCase =
-    | BeforeReservationPrice of BeforeReservationPriceCase
-    | EstimateAppraised of EstimateAppraisedCase
-    | EstimateDetermined of EstimateDeterminedCase
-    | EstimateDelivered of EstimateDeliveredCase
+@dataclass(frozen=True)
+class UndeterminedReservationPrice:
+    common: ReservationPriceCommon
+    kind: Literal["undetermined"] = "undetermined"
 
-// 委託販売案件
-type BeforeConsignmentCase = { Common: SalesCaseCommon }
-type ConsignmentDesignatedCase = { Common: SalesCaseCommon; ConsignorInfo: ConsignorInfo }
-type ConsignmentResultEnteredCase = { Common: SalesCaseCommon; ConsignorInfo: ConsignorInfo; Result: ConsignmentResult }
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "kind", "undetermined")
 
-type ConsignmentSalesCase =
-    | BeforeConsignment of BeforeConsignmentCase
-    | ConsignmentDesignated of ConsignmentDesignatedCase
-    | ConsignmentResultEntered of ConsignmentResultEnteredCase
 
-// 販売案件（全種別統合）
-type SalesCase =
-    | Direct of DirectSalesCase
-    | Reservation of ReservationSalesCase
-    | Consignment of ConsignmentSalesCase
+@dataclass(frozen=True)
+class DeterminedReservationPrice:
+    common: ReservationPriceCommon
+    determined_date: date
+    determined_amount: int
+    kind: Literal["determined"] = "determined"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "kind", "determined")
+
+
+EstimatePriceAppraisal = UndeterminedReservationPrice | DeterminedReservationPrice
+
+
+# ---------- 予約販売案件（4段階の状態） ----------
+
+@dataclass(frozen=True)
+class BeforeReservationPriceCase:
+    """予約価格査定前"""
+    common: SalesCaseCommon
+    status: Literal["before_reservation_price"] = "before_reservation_price"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", "before_reservation_price")
+
+
+@dataclass(frozen=True)
+class EstimateAppraisedCase:
+    """予約価格査定済み"""
+    common: SalesCaseCommon
+    appraisal: EstimatePriceAppraisal
+    status: Literal["estimate_appraised"] = "estimate_appraised"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", "estimate_appraised")
+
+
+@dataclass(frozen=True)
+class EstimateDeterminedCase:
+    """予約価格確定済み"""
+    common: SalesCaseCommon
+    appraisal: EstimatePriceAppraisal
+    determined_date: date
+    status: Literal["estimate_determined"] = "estimate_determined"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", "estimate_determined")
+
+
+@dataclass(frozen=True)
+class EstimateDeliveredCase:
+    """予約出荷済み"""
+    common: SalesCaseCommon
+    appraisal: EstimatePriceAppraisal
+    determined_date: date
+    delivery_date: date
+    status: Literal["estimate_delivered"] = "estimate_delivered"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", "estimate_delivered")
+
+
+ReservationSalesCase = (
+    BeforeReservationPriceCase
+    | EstimateAppraisedCase
+    | EstimateDeterminedCase
+    | EstimateDeliveredCase
+)
+```
+
+### src/domain/consignment_case.py
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Literal
+
+from src.domain.sales_case import SalesCaseCommon
+
+
+@dataclass(frozen=True)
+class ConsignorInfo:
+    consignor_code: str
+    consignor_name: str
+
+
+@dataclass(frozen=True)
+class ConsignmentResult:
+    result_amount: int
+    result_date: str  # ISO 8601
+
+
+@dataclass(frozen=True)
+class BeforeConsignmentCase:
+    """委託指定前"""
+    common: SalesCaseCommon
+    status: Literal["before_consignment"] = "before_consignment"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", "before_consignment")
+
+
+@dataclass(frozen=True)
+class ConsignmentDesignatedCase:
+    """委託先指定済み"""
+    common: SalesCaseCommon
+    consignor_info: ConsignorInfo
+    status: Literal["consignment_designated"] = "consignment_designated"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", "consignment_designated")
+
+
+@dataclass(frozen=True)
+class ConsignmentResultEnteredCase:
+    """委託結果入力済み"""
+    common: SalesCaseCommon
+    consignor_info: ConsignorInfo
+    result: ConsignmentResult
+    status: Literal["consignment_result_entered"] = "consignment_result_entered"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", "consignment_result_entered")
+
+
+ConsignmentSalesCase = (
+    BeforeConsignmentCase
+    | ConsignmentDesignatedCase
+    | ConsignmentResultEnteredCase
+)
+```
+
+### src/domain/all_cases.py（全種別統合）
+
+```python
+from __future__ import annotations
+
+from src.domain.sales_case import DirectSalesCase
+from src.domain.reservation_case import ReservationSalesCase
+from src.domain.consignment_case import ConsignmentSalesCase
+
+SalesCase = DirectSalesCase | ReservationSalesCase | ConsignmentSalesCase
 ```
 
 ---
 
-## Kotlin 期待される型定義の構造
+## TypeScript 型定義
 
-```kotlin
-// domain/ReservationCaseTypes.kt
-package salesmanagement.domain
+### src/types/reservation_case.ts
 
-// 予約価格
-sealed interface EstimatePriceAppraisal {
-    val common: ReservationPriceCommon
+```typescript
+import type { SalesCaseCommon } from '@/types/sales_case'
 
-    data class Undetermined(override val common: ReservationPriceCommon) : EstimatePriceAppraisal
-    data class Determined(
-        override val common: ReservationPriceCommon,
-        val determinedDate: LocalDate,
-        val determinedAmount: Amount
-    ) : EstimatePriceAppraisal
+export interface ReservationPriceCommon {
+  readonly appraisalNumberYear: number
+  readonly appraisalNumberMonth: number
+  readonly appraisalNumberSeq: number
+  readonly appraisalDate: string
+  readonly estimatedLotInfo: string
+  readonly estimatedAmount: number
 }
 
-// 予約販売案件
-sealed interface ReservationSalesCase {
-    val common: SalesCaseCommon
-
-    data class BeforeReservationPrice(override val common: SalesCaseCommon) : ReservationSalesCase
-    data class EstimateAppraised(override val common: SalesCaseCommon, val appraisal: EstimatePriceAppraisal) : ReservationSalesCase
-    data class EstimateDetermined(override val common: SalesCaseCommon, val appraisal: EstimatePriceAppraisal, val determinedDate: LocalDate) : ReservationSalesCase
-    data class EstimateDelivered(override val common: SalesCaseCommon, val appraisal: EstimatePriceAppraisal, val determinedDate: LocalDate, val deliveryDate: LocalDate) : ReservationSalesCase
+export interface UndeterminedReservationPrice {
+  readonly kind: 'undetermined'
+  readonly common: ReservationPriceCommon
 }
 
-// 委託販売案件
-sealed interface ConsignmentSalesCase {
-    val common: SalesCaseCommon
-
-    data class BeforeConsignment(override val common: SalesCaseCommon) : ConsignmentSalesCase
-    data class ConsignmentDesignated(override val common: SalesCaseCommon, val consignorInfo: ConsignorInfo) : ConsignmentSalesCase
-    data class ConsignmentResultEntered(override val common: SalesCaseCommon, val consignorInfo: ConsignorInfo, val result: ConsignmentResult) : ConsignmentSalesCase
+export interface DeterminedReservationPrice {
+  readonly kind: 'determined'
+  readonly common: ReservationPriceCommon
+  readonly determinedDate: string
+  readonly determinedAmount: number
 }
 
-// 販売案件（全種別統合）
-sealed interface SalesCase {
-    data class Direct(val case: DirectSalesCase) : SalesCase
-    data class Reservation(val case: ReservationSalesCase) : SalesCase
-    data class Consignment(val case: ConsignmentSalesCase) : SalesCase
+export type EstimatePriceAppraisal = UndeterminedReservationPrice | DeterminedReservationPrice
+
+export interface BeforeReservationPriceCase extends SalesCaseCommon {
+  readonly status: 'before_reservation_price'
 }
+
+export interface EstimateAppraisedCase extends SalesCaseCommon {
+  readonly status: 'estimate_appraised'
+  readonly appraisal: EstimatePriceAppraisal
+}
+
+export interface EstimateDeterminedCase extends SalesCaseCommon {
+  readonly status: 'estimate_determined'
+  readonly appraisal: EstimatePriceAppraisal
+  readonly determinedDate: string
+}
+
+export interface EstimateDeliveredCase extends SalesCaseCommon {
+  readonly status: 'estimate_delivered'
+  readonly appraisal: EstimatePriceAppraisal
+  readonly determinedDate: string
+  readonly deliveryDate: string
+}
+
+export type ReservationSalesCase =
+  | BeforeReservationPriceCase
+  | EstimateAppraisedCase
+  | EstimateDeterminedCase
+  | EstimateDeliveredCase
+```
+
+### src/types/consignment_case.ts
+
+```typescript
+import type { SalesCaseCommon } from '@/types/sales_case'
+
+export interface ConsignorInfo {
+  readonly consignorCode: string
+  readonly consignorName: string
+}
+
+export interface ConsignmentResult {
+  readonly resultAmount: number
+  readonly resultDate: string
+}
+
+export interface BeforeConsignmentCase extends SalesCaseCommon {
+  readonly status: 'before_consignment'
+}
+
+export interface ConsignmentDesignatedCase extends SalesCaseCommon {
+  readonly status: 'consignment_designated'
+  readonly consignorInfo: ConsignorInfo
+}
+
+export interface ConsignmentResultEnteredCase extends SalesCaseCommon {
+  readonly status: 'consignment_result_entered'
+  readonly consignorInfo: ConsignorInfo
+  readonly result: ConsignmentResult
+}
+
+export type ConsignmentSalesCase =
+  | BeforeConsignmentCase
+  | ConsignmentDesignatedCase
+  | ConsignmentResultEnteredCase
+```
+
+### src/types/all_cases.ts
+
+```typescript
+import type { DirectSalesCase } from '@/types/sales_case'
+import type { ReservationSalesCase } from '@/types/reservation_case'
+import type { ConsignmentSalesCase } from '@/types/consignment_case'
+
+export type SalesCase = DirectSalesCase | ReservationSalesCase | ConsignmentSalesCase
 ```
 
 ---
 
 ## ポイント
 
-- `SalesCase` が全種別を統合するトップレベルの型。これにより「予約販売案件に販売契約を締結する」操作が型レベルで不可能になる
-- 予約価格は確定前/確定後で型が分かれる（確定後は確定金額が必須）
-- 品目変換は在庫ロットに新しい状態を追加する拡張
+- `SalesCase` が全種別を統合するトップレベルの型。「予約販売案件に販売契約を締結する」操作が型レベルで不可能
+- 予約価格は確定前/確定後で型が分かれる（`kind` で discriminate）
+- `status` フィールドが全種別で一意のため、`switch/match` で全分岐を網羅できる
 
 ---
 
 ## 次のステップ
 
-Step 16が完了したら [Step 17: マイグレーション追加](./step17.md) へ進む。
+Step 16が完了したら [Step 17: マイグレーション追加（予約・委託テーブル）](./step17.md) へ進む。

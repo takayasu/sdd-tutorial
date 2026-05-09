@@ -4,217 +4,159 @@
 
 ### これは何か
 
-リンター（FSharpLint / detekt）を導入する。リンターとは、コードの「品質上の問題」を自動検出するツール。フォーマッターが「見た目」を整えるのに対し、リンターは「書き方の良し悪し」を指摘する。
+コードの「品質上の問題」を自動検出するツールを導入する。フォーマッターが「見た目」を整えるのに対し、リンターは「意味的な問題」を検出する。
+
+- Python: **ruff check**（flake8 + isort + pyupgrade 等を統合した高速リンター）
+- TypeScript/React: **ESLint**
 
 ### なぜやるのか
 
-検出する問題の例：
-- 関数が長すぎる（50行以上 → 分割すべき）
-- ネストが深すぎる（if文の中にif文の中にif文... → 読みにくい）
-- マジックナンバー（`if x > 86400` → `if x > SECONDS_PER_DAY` にすべき）
-- 使われていない変数
+- 未使用変数、到達不能なコード、型の誤使用などを自動検出する
+- AIが生成したコードに含まれる潜在的なバグをCIで早期発見する
+- セキュリティリスクになるコードパターン（例: `eval()` の使用）を検出できる
 
 ### 何がうれしいのか
 
-- AIが生成したコードの品質を自動チェックできる。「動くけど読みにくいコード」を防げる
-- チーム全体のコード品質が底上げされる
-- CIに組み込むことで、品質基準を満たさないコードがマージされることを防げる
+- 人間のコードレビューで指摘するような定型的な問題をツールが代行する
+- コードレビューの議論が「実質的な問題」に集中できる
 
 ## 完了条件
 
-### F#（FSharpLint）
-
 ```bash
-$ cd ../sales-management/apps/api-fsharp
-$ dotnet tool run fsharplint lint src/SalesManagement/SalesManagement.fsproj
-========== Linting src/SalesManagement/SalesManagement.fsproj ==========
-No lint warnings found.
+# Python: リントチェック
+$ cd backend && ruff check src/ tests/
+All checks passed!
 $ echo $?
 0
-```
 
-### Kotlin（detekt）
+# TypeScript: リントチェック
+$ cd frontend && npx eslint src/
+$ echo $?
+0
 
-```bash
-$ cd kotlin
-$ gradle detekt
-> Task :detekt
-BUILD SUCCESSFUL in Xs
-
-# 警告がある場合
-$ gradle detekt
-> Task :detekt FAILED
-src/main/kotlin/salesmanagement/Application.kt:15:5: MagicNumber - ...
-FAILURE: Build failed with an exception.
+# ci.sh が緑
+$ ./ci.sh
+=== リンター (Python) ===
+All checks passed!
+=== リンター (TypeScript) ===
+（警告・エラーなし）
 ```
 
 ---
 
-## F#（FSharpLint）
+## Python（ruff check）
 
-### 1. ツールマニフェスト作成
+### 1. ruff の lint 設定（pyproject.toml に追記）
 
-```bash
-cd ../sales-management/apps/api-fsharp
-dotnet new tool-manifest
-dotnet tool install dotnet-fsharplint
+```toml
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+    "N",    # pep8-naming
+]
+ignore = [
+    "S101",  # assert 文（テストでの使用を許可）
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["B"]
 ```
 
-### 2. 設定ファイル作成
+### 2. 実行
 
 ```bash
-# fsharp/fsharplint.json
-cat > fsharp/fsharplint.json << 'EOF'
-{
-  "typedChecks": {
-    "enabled": true
+cd backend
+
+# チェックのみ（CI用）
+ruff check src/ tests/
+
+# 自動修正できる問題を修正（開発時）
+ruff check --fix src/ tests/
+```
+
+### 3. よくある検出例
+
+```python
+# F401: 未使用インポート → 削除される
+import os  # 使っていない場合
+
+# B006: ミュータブルなデフォルト引数
+def bad(items: list = []) -> list:  # NG
+    return items
+
+def good(items: list | None = None) -> list:  # OK
+    return items or []
+
+# UP006: 古い型ヒント
+from typing import List  # NG
+items: List[str]
+
+items: list[str]  # OK（Python 3.9+）
+```
+
+---
+
+## TypeScript/React（ESLint）
+
+### 1. eslint.config.js
+
+```javascript
+import js from '@eslint/js'
+import tseslint from 'typescript-eslint'
+import reactHooks from 'eslint-plugin-react-hooks'
+import reactRefresh from 'eslint-plugin-react-refresh'
+
+export default tseslint.config(
+  { ignores: ['dist', 'coverage'] },
+  {
+    extends: [js.configs.recommended, ...tseslint.configs.recommended],
+    files: ['**/*.{ts,tsx}'],
+    plugins: {
+      'react-hooks': reactHooks,
+      'react-refresh': reactRefresh,
+    },
+    rules: {
+      ...reactHooks.configs.recommended.rules,
+      'react-refresh/only-export-components': ['warn', { allowConstantExport: true }],
+      '@typescript-eslint/no-unused-vars': 'error',
+      '@typescript-eslint/no-explicit-any': 'warn',
+    },
   },
-  "conventions": {
-    "recursiveAsyncFunction": { "enabled": true },
-    "redundantNewKeyword": { "enabled": true },
-    "nestedStatements": {
-      "enabled": true,
-      "config": { "depth": 5 }
-    },
-    "numberOfItems": {
-      "maxFunctionDefinitionParameters": { "enabled": true, "config": { "maxItems": 5 } },
-      "maxTupleSize": { "enabled": true, "config": { "maxItems": 4 } }
-    },
-    "sourceLength": {
-      "maxLinesInFunction": { "enabled": true, "config": { "maxLines": 50 } },
-      "maxLinesInModule": { "enabled": true, "config": { "maxLines": 500 } }
-    }
-  }
-}
-EOF
+)
 ```
 
-### 3. 実行
+### 2. 実行
 
 ```bash
-dotnet tool run fsharplint lint src/SalesManagement/SalesManagement.fsproj
-```
+cd frontend
 
-### 4. ci.sh への追加
+# チェックのみ（CI用）
+npx eslint src/
 
-```bash
-echo "=== リンター ==="
-dotnet tool run fsharplint lint src/SalesManagement/SalesManagement.fsproj
+# 自動修正（開発時）
+npx eslint --fix src/
 ```
 
 ---
 
-## Kotlin（detekt）
-
-### 1. Gradle設定追加（build.gradle.kts）
-
-```kotlin
-plugins {
-    // 既存のpluginsに追加
-    id("io.gitlab.arturbosch.detekt") version "1.23.6"
-}
-
-detekt {
-    config.setFrom("detekt.yml")
-    buildUponDefaultConfig = true
-}
-```
-
-### 2. 設定ファイル作成
+## ci.sh への追加
 
 ```bash
-# kotlin/detekt.yml
-cat > kotlin/detekt.yml << 'EOF'
-complexity:
-  LongMethod:
-    threshold: 30
-  ComplexMethod:
-    threshold: 10
-  CognitiveComplexMethod:
-    threshold: 10
-  LargeClass:
-    threshold: 300
-  TooManyFunctions:
-    threshold: 15
+echo "=== リンター (Python) ==="
+cd backend
+ruff check src/ tests/
+cd ..
 
-style:
-  MagicNumber:
-    active: true
-    ignoreNumbers:
-      - '-1'
-      - '0'
-      - '1'
-      - '2'
-  VarCouldBeVal:
-    active: true
-  UnnecessaryLet:
-    active: true
-
-potential-bugs:
-  CastToNullableType:
-    active: true
-  UnnecessaryNotNullOperator:
-    active: true
-
-# --- 関数型スタイル強制ルール ---
-# Kotlinを関数型スタイルで書くための追加制約
-
-style:
-  # var禁止（immutableデフォルト）
-  VarCouldBeVal:
-    active: true
-  # mutableコレクション使用を検出
-  MutableCollectionMutableState:
-    active: true
-
-naming:
-  # data classのプロパティはval強制（detektデフォルトで検出）
-  InvalidPackageDeclaration:
-    active: true
-
-complexity:
-  # when式の網羅性を強制（sealed classの全ケース処理）
-  # → コンパイラが強制するため追加ルール不要だが、else禁止で明示
-  ComplexMethod:
-    threshold: 10
-
-potential-bugs:
-  # !!演算子（強制アンラップ）禁止 → Eitherで処理すべき
-  UnnecessaryNotNullOperator:
-    active: true
-  # as?キャスト禁止 → sealed classのwhenで処理すべき
-  CastToNullableType:
-    active: true
-
-# カスタムルール案（detekt custom rule or forbiddenMethodCall で実現）
-forbidden:
-  ForbiddenMethodCall:
-    active: true
-    methods:
-      # mutableListOf等を禁止
-      - 'kotlin.collections.mutableListOf'
-      - 'kotlin.collections.mutableMapOf'
-      - 'kotlin.collections.mutableSetOf'
-      # var宣言を伴うパターンはVarCouldBeValで検出
-EOF
+echo "=== リンター (TypeScript) ==="
+cd frontend
+npx eslint src/
+cd ..
 ```
-
-> **関数型スタイル強制の方針**: `var`禁止・mutableコレクション禁止・`!!`禁止をdetektで静的に検出する。sealed classの網羅的when処理はKotlinコンパイラが`-Werror`で強制する。Arrow（Either/NonEmptyList）の使用はコードレビューとPBTで担保する。
-
-### 3. 実行
-
-```bash
-gradle detekt
-```
-
-### 4. ci.sh への追加
-
-```bash
-echo "=== リンター ==="
-gradle detekt
-```
-
----
 
 ## ci.sh の現時点の構成
 
@@ -222,17 +164,29 @@ gradle detekt
 #!/bin/bash
 set -e
 
-echo "=== ビルド ==="
-# F#: dotnet build --warnaserror
-# Kotlin: gradle build
+echo "=== DB起動確認 ==="
+docker compose up -d db
+until docker compose exec db pg_isready -U app -d sales_management >/dev/null 2>&1; do
+  sleep 2
+done
 
-echo "=== フォーマットチェック ==="
-# F#: dotnet fantomas --check src/
-# Kotlin: gradle ktfmtCheck
+echo "=== マイグレーション ==="
+cd backend && alembic upgrade head && cd ..
 
-echo "=== リンター ==="
-# F#: dotnet tool run fsharplint lint src/SalesManagement/SalesManagement.fsproj
-# Kotlin: gradle detekt
+echo "=== フォーマットチェック (Python) ==="
+cd backend && ruff format --check src/ tests/ && cd ..
+
+echo "=== フォーマットチェック (TypeScript) ==="
+cd frontend && npx prettier --check "src/**/*.{ts,tsx}" && cd ..
+
+echo "=== リンター (Python) ==="
+cd backend && ruff check src/ tests/ && cd ..
+
+echo "=== リンター (TypeScript) ==="
+cd frontend && npx eslint src/ && cd ..
+
+echo "=== verify (smoke) ==="
+# Step 1 で導入済み
 ```
 
 ---

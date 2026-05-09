@@ -4,250 +4,402 @@
 
 ### これは何か
 
-ドメインモデルDSL（domain-model-section1.md）をAI（Kiro CLI）に渡して、プログラミング言語の「型定義」に変換する。型定義とは、データの構造を厳密に定義したもの。
+ドメインモデルの中心となる「在庫ロット（InventoryLot）」を、Python の frozen dataclass と TypeScript の discriminated union で型定義する。
+
+- **状態を型で表現する**: `製造中 | 製造完了 | 出荷指示済み | 出荷済み` を Union 型で表す
+- **不正な状態を型レベルで弾く**: `shipped_date` は `ShippedLot` にしか存在しない
+- **スマートコンストラクタ**: `Quantity(0)` は `__post_init__` で即座に例外を投げる
 
 ### なぜやるのか
 
-- 「在庫ロットには製造中・製造完了・出荷指示済み・出荷完了の4状態がある」というビジネスルールを、コードの構造そのもので表現する
-- 型で表現することで、「製造中ロットに出荷日がある」といった不正な状態がそもそも作れなくなる（コンパイルエラーになる）
-- DSLという仕様書から型定義を自動生成するため、仕様と実装がずれない
+- 「出荷済みなのに `shipped_date` が None」のような矛盾した状態をランタイムエラーではなく型エラーにする
+- AIが生成したコードが「意味的に正しいか」をmypyとTypeScriptコンパイラが自動検証する
+- ドメイン知識がコードに直接埋め込まれ、ドキュメントと乖離しない
 
 ### 何がうれしいのか
 
-- バグの多くは「ありえない状態」が発生することで起きる。型で防げば、テストを書く前にバグを潰せる
-- 仕様変更時はDSLを変更 → 型を再生成するだけ。手動で整合性を取る必要がない
-- F#の判別共用体 / Kotlinのsealed classが、DSLの `OR` にそのまま対応する
+- `match lot:` で全状態を網羅しないとmypyが警告する
+- フロントエンドの `switch (lot.status)` も全分岐を書かないとTypeScriptが怒る
+- 新しい状態（例: 返品中）を追加したとき、対応漏れがコンパイル時に発覚する
 
 ## 完了条件
 
-### F#
+```bash
+# Python: 型チェック通過
+$ cd backend && mypy src/domain/lot.py --strict
+Success: no issues found in 1 source file
+
+# Python: リントチェック通過
+$ ruff check src/domain/lot.py
+All checks passed!
+
+# TypeScript: 型チェック通過
+$ cd frontend && npx tsc --noEmit
+（エラーなし）
+
+# ci.sh が緑
+$ ./ci.sh
+（変更なし — この Step は型定義のみ、APIエンドポイントは Step 7）
+```
+
+---
+
+## Python 型定義
+
+### 1. 依存追加（pyproject.toml）
+
+```toml
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+    "ruff>=0.6",
+    "mypy>=1.10",
+    "hypothesis>=6",
+]
+```
 
 ```bash
-$ cd ../sales-management/apps/api-fsharp
-$ dotnet build
-  SalesManagement -> /path/to/bin/Debug/net8.0/SalesManagement.dll
-  Build succeeded.
-      0 Warning(s)
-      0 Error(s)
-
-# 型が定義されていることを確認（REPLで）
-$ dotnet fsi
-> open SalesManagement.Domain.Types;;
-> let lot = Manufacturing { Common = { LotNumber = { Year = 2024; Location = "A"; Seq = 1 }; ... } };;
-val lot : InventoryLot = Manufacturing ...
+cd backend && uv sync
 ```
 
-### Kotlin
+### 2. src/domain/lot.py
 
-```bash
-$ cd kotlin
-$ gradle build
-BUILD SUCCESSFUL in Xs
+```python
+from __future__ import annotations
 
-# 型が定義されていることを確認（テストで）
-$ gradle test --tests "*TypesTest*"
-BUILD SUCCESSFUL in Xs
+from dataclasses import dataclass
+from datetime import date
+from typing import Literal
+
+
+# ---------- 値オブジェクト ----------
+
+@dataclass(frozen=True)
+class LotNumber:
+    year: int
+    location: str
+    seq: int
+
+    def __post_init__(self) -> None:
+        if self.year < 2000 or self.year > 2099:
+            raise ValueError(f"lot_number_year must be 2000–2099, got {self.year}")
+        if not self.location:
+            raise ValueError("lot_number_location must not be empty")
+        if self.seq < 1:
+            raise ValueError(f"lot_number_seq must be >= 1, got {self.seq}")
+
+    def __str__(self) -> str:
+        return f"{self.year}-{self.location}-{self.seq:04d}"
+
+
+@dataclass(frozen=True)
+class Quantity:
+    value: int
+
+    def __post_init__(self) -> None:
+        if self.value <= 0:
+            raise ValueError(f"Quantity must be > 0, got {self.value}")
+
+
+@dataclass(frozen=True)
+class Count:
+    value: int
+
+    def __post_init__(self) -> None:
+        if self.value < 0:
+            raise ValueError(f"Count must be >= 0, got {self.value}")
+
+
+@dataclass(frozen=True)
+class Amount:
+    value: int  # 円単位の整数（小数点以下切り捨て）
+
+    def __post_init__(self) -> None:
+        if self.value < 0:
+            raise ValueError(f"Amount must be >= 0, got {self.value}")
+
+
+# ---------- 共通フィールド ----------
+
+@dataclass(frozen=True)
+class LotCommon:
+    lot_number: LotNumber
+    division_code: int
+    department_code: int
+    section_code: int
+    process_category: int
+    inspection_category: int
+    manufacturing_category: int
+
+
+# ---------- 状態別 Lot ----------
+
+@dataclass(frozen=True)
+class ManufacturingLot:
+    """製造中"""
+    status: Literal["manufacturing"] = "manufacturing"
+    common: LotCommon = ...  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", "manufacturing")
+
+
+@dataclass(frozen=True)
+class ManufacturedLot:
+    """製造完了"""
+    common: LotCommon
+    manufacturing_completed_date: date
+    status: Literal["manufactured"] = "manufactured"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", "manufactured")
+
+
+@dataclass(frozen=True)
+class ShippingInstructedLot:
+    """出荷指示済み"""
+    common: LotCommon
+    manufacturing_completed_date: date
+    shipping_deadline_date: date
+    status: Literal["shipping_instructed"] = "shipping_instructed"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", "shipping_instructed")
+        if self.shipping_deadline_date < self.manufacturing_completed_date:
+            raise ValueError("shipping_deadline_date must be >= manufacturing_completed_date")
+
+
+@dataclass(frozen=True)
+class ShippedLot:
+    """出荷済み"""
+    common: LotCommon
+    manufacturing_completed_date: date
+    shipping_deadline_date: date
+    shipped_date: date
+    status: Literal["shipped"] = "shipped"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", "shipped")
+        if self.shipped_date < self.manufacturing_completed_date:
+            raise ValueError("shipped_date must be >= manufacturing_completed_date")
+
+
+# ---------- Union 型 ----------
+
+InventoryLot = ManufacturingLot | ManufacturedLot | ShippingInstructedLot | ShippedLot
 ```
 
----
+### 3. mypy 設定（pyproject.toml に追記）
 
-## Kiro CLIでの変換
-
-domain-model-section1.md をコンテキストとして渡し、型定義を生成する。
-
----
-
-## F# 期待される型定義の構造
-
-```fsharp
-// Types.fs
-module SalesManagement.Domain.Types
-
-// NonEmptyList（1件以上を型で保証）
-type NonEmptyList<'a> = { Head: 'a; Tail: 'a list }
-
-// 基本値型
-type DivisionCode = DivisionCode of int
-type DepartmentCode = DepartmentCode of int
-type SectionCode = SectionCode of int
-
-type LotNumber = {
-    Year: int
-    Location: string
-    Seq: int
-}
-
-type Amount = private Amount of int
-type Quantity = private Quantity of decimal
-type Count = private Count of int
-
-// 品目区分
-type ItemCategory =
-    | Standard
-    | Premium
-    | Special
-
-// ロット明細
-type LotDetail = {
-    ItemCategory: ItemCategory
-    PremiumCategory: string option
-    ProductCategoryCode: string
-    LengthSpecLower: decimal
-    ThicknessSpecLower: decimal
-    ThicknessSpecUpper: decimal
-    QualityGrade: string
-    Count: Count
-    Quantity: Quantity
-    InspectionResultCategory: string option
-}
-
-// ロット共通
-type LotCommon = {
-    LotNumber: LotNumber
-    DivisionCode: DivisionCode
-    DepartmentCode: DepartmentCode
-    SectionCode: SectionCode
-    ProcessCategory: int
-    InspectionCategory: int
-    ManufacturingCategory: int
-    Details: LotDetail NonEmptyList  // 1件以上を型で保証
-}
-
-// 在庫ロット（状態を型で表現）
-type ManufacturingLot = { Common: LotCommon }
-
-type ManufacturedLot = {
-    Common: LotCommon
-    ManufacturingCompletedDate: System.DateOnly
-}
-
-type ShippingInstructedLot = {
-    Common: LotCommon
-    ManufacturingCompletedDate: System.DateOnly
-    ShippingDeadlineDate: System.DateOnly
-}
-
-type ShippedLot = {
-    Common: LotCommon
-    ManufacturingCompletedDate: System.DateOnly
-    ShippingDeadlineDate: System.DateOnly
-    ShippedDate: System.DateOnly
-}
-
-type InventoryLot =
-    | Manufacturing of ManufacturingLot
-    | Manufactured of ManufacturedLot
-    | ShippingInstructed of ShippingInstructedLot
-    | Shipped of ShippedLot
+```toml
+[tool.mypy]
+python_version = "3.12"
+strict = true
+exclude = ["alembic/"]
 ```
 
----
+### 4. 使用例
 
-## Kotlin 期待される型定義の構造
+```python
+from src.domain.lot import (
+    LotCommon,
+    LotNumber,
+    ManufacturingLot,
+    ManufacturedLot,
+    ShippedLot,
+    InventoryLot,
+)
+from datetime import date
 
-### 依存関係追加（build.gradle.kts）
-
-```kotlin
-dependencies {
-    // 既存に追加（NonEmptyList等を使用）
-    implementation("io.arrow-kt:arrow-core:1.2.4")
-}
-```
-
-### 型定義
-
-```kotlin
-// Types.kt
-package salesmanagement.domain
-
-import arrow.core.NonEmptyList
-import java.time.LocalDate
-
-// 基本値型
-@JvmInline value class DivisionCode(val value: Int)
-@JvmInline value class DepartmentCode(val value: Int)
-@JvmInline value class SectionCode(val value: Int)
-
-data class LotNumber(
-    val year: Int,
-    val location: String,
-    val seq: Int
+common = LotCommon(
+    lot_number=LotNumber(year=2024, location="TK", seq=1),
+    division_code=1,
+    department_code=10,
+    section_code=100,
+    process_category=1,
+    inspection_category=1,
+    manufacturing_category=1,
 )
 
-@JvmInline value class Amount(val value: Int) { init { require(value >= 0) } }
-@JvmInline value class Quantity(val value: Double) { init { require(value >= 0.001) } }
-@JvmInline value class Count(val value: Int) { init { require(value >= 1) } }
+# 製造中 → 製造完了 への遷移
+manufacturing = ManufacturingLot(common=common)
+manufactured = ManufacturedLot(
+    common=common,
+    manufacturing_completed_date=date(2024, 3, 1),
+)
 
-// 品目区分
-sealed interface ItemCategory {
-    data object Standard : ItemCategory
-    data object Premium : ItemCategory
-    data object Special : ItemCategory
+# match で全状態を網羅
+def describe(lot: InventoryLot) -> str:
+    match lot:
+        case ManufacturingLot():
+            return "製造中"
+        case ManufacturedLot(manufacturing_completed_date=d):
+            return f"製造完了: {d}"
+        case ShippingInstructedLot(shipping_deadline_date=d):
+            return f"出荷期限: {d}"
+        case ShippedLot(shipped_date=d):
+            return f"出荷済み: {d}"
+```
+
+---
+
+## TypeScript 型定義
+
+### 1. src/types/lot.ts
+
+```typescript
+// ---------- 値オブジェクト ----------
+
+export interface LotNumber {
+  readonly year: number
+  readonly location: string
+  readonly seq: number
 }
 
-// ロット明細
-data class LotDetail(
-    val itemCategory: ItemCategory,
-    val premiumCategory: String?,
-    val productCategoryCode: String,
-    val lengthSpecLower: Double,
-    val thicknessSpecLower: Double,
-    val thicknessSpecUpper: Double,
-    val qualityGrade: String,
-    val count: Count,
-    val quantity: Quantity,
-    val inspectionResultCategory: String?
-)
+export function formatLotNumber(lot: LotNumber): string {
+  return `${lot.year}-${lot.location}-${String(lot.seq).padStart(4, '0')}`
+}
 
-// ロット共通
-data class LotCommon(
-    val lotNumber: LotNumber,
-    val divisionCode: DivisionCode,
-    val departmentCode: DepartmentCode,
-    val sectionCode: SectionCode,
-    val processCategory: Int,
-    val inspectionCategory: Int,
-    val manufacturingCategory: Int,
-    val details: NonEmptyList<LotDetail>  // 1件以上を型で保証
-)
+// ---------- 共通フィールド ----------
 
-// 在庫ロット（状態を型で表現）
-sealed interface InventoryLot {
-    val common: LotCommon
+export interface LotCommon {
+  readonly lotNumber: LotNumber
+  readonly divisionCode: number
+  readonly departmentCode: number
+  readonly sectionCode: number
+  readonly processCategory: number
+  readonly inspectionCategory: number
+  readonly manufacturingCategory: number
+}
 
-    data class Manufacturing(override val common: LotCommon) : InventoryLot
+// ---------- 状態別 Lot ----------
 
-    data class Manufactured(
-        override val common: LotCommon,
-        val manufacturingCompletedDate: LocalDate
-    ) : InventoryLot
+export interface ManufacturingLot extends LotCommon {
+  readonly status: 'manufacturing'
+}
 
-    data class ShippingInstructed(
-        override val common: LotCommon,
-        val manufacturingCompletedDate: LocalDate,
-        val shippingDeadlineDate: LocalDate
-    ) : InventoryLot
+export interface ManufacturedLot extends LotCommon {
+  readonly status: 'manufactured'
+  readonly manufacturingCompletedDate: string  // ISO 8601
+}
 
-    data class Shipped(
-        override val common: LotCommon,
-        val manufacturingCompletedDate: LocalDate,
-        val shippingDeadlineDate: LocalDate,
-        val shippedDate: LocalDate
-    ) : InventoryLot
+export interface ShippingInstructedLot extends LotCommon {
+  readonly status: 'shipping_instructed'
+  readonly manufacturingCompletedDate: string
+  readonly shippingDeadlineDate: string
+}
+
+export interface ShippedLot extends LotCommon {
+  readonly status: 'shipped'
+  readonly manufacturingCompletedDate: string
+  readonly shippingDeadlineDate: string
+  readonly shippedDate: string
+}
+
+// ---------- Discriminated Union ----------
+
+export type InventoryLot =
+  | ManufacturingLot
+  | ManufacturedLot
+  | ShippingInstructedLot
+  | ShippedLot
+
+// ---------- 型ガード ----------
+
+export function isShipped(lot: InventoryLot): lot is ShippedLot {
+  return lot.status === 'shipped'
+}
+```
+
+### 2. 使用例
+
+```typescript
+import type { InventoryLot } from '@/types/lot'
+
+function describeLot(lot: InventoryLot): string {
+  switch (lot.status) {
+    case 'manufacturing':
+      return '製造中'
+    case 'manufactured':
+      return `製造完了: ${lot.manufacturingCompletedDate}`
+    case 'shipping_instructed':
+      return `出荷期限: ${lot.shippingDeadlineDate}`
+    case 'shipped':
+      return `出荷済み: ${lot.shippedDate}`
+    // TypeScript が全分岐を網羅しているか検証
+    default: {
+      const _exhaustive: never = lot
+      return _exhaustive
+    }
+  }
 }
 ```
 
 ---
 
-## ポイント
+## Pydantic スキーマ（API 層）との分離
 
-- F#: 判別共用体（`type InventoryLot = Manufacturing of ... | Manufactured of ...`）でDSLのORを直接表現
-- Kotlin: `sealed interface` + `data class` でORを表現。`@JvmInline value class` で基本値型をラップ
-- 両言語とも、不正な状態（例：製造中ロットに出荷日がある）が型レベルで存在できない
-- `NonEmptyList` により「1件以上」の制約を型レベルで保証。空リストを渡すコードがコンパイルエラーになる
+ドメイン型（`src/domain/lot.py`）と API スキーマ（`src/schemas/lot.py`）は**別ファイルに分ける**。
+
+```python
+# src/schemas/lot.py — FastAPI レスポンス用
+from __future__ import annotations
+
+from datetime import date
+from typing import Literal
+
+from pydantic import BaseModel
+
+
+class ManufacturingLotResponse(BaseModel):
+    status: Literal["manufacturing"]
+    lot_number_year: int
+    lot_number_location: str
+    lot_number_seq: int
+    division_code: int
+    department_code: int
+    section_code: int
+    process_category: int
+    inspection_category: int
+    manufacturing_category: int
+
+
+class ManufacturedLotResponse(ManufacturingLotResponse):
+    status: Literal["manufactured"]
+    manufacturing_completed_date: date
+
+
+class ShippingInstructedLotResponse(ManufacturedLotResponse):
+    status: Literal["shipping_instructed"]
+    shipping_deadline_date: date
+
+
+class ShippedLotResponse(ShippingInstructedLotResponse):
+    status: Literal["shipped"]
+    shipped_date: date
+
+
+LotResponse = (
+    ManufacturingLotResponse
+    | ManufacturedLotResponse
+    | ShippingInstructedLotResponse
+    | ShippedLotResponse
+)
+```
+
+### 分離する理由
+
+| 層 | 型 | 役割 |
+|---|---|---|
+| ドメイン層 | `frozen dataclass` | ビジネスルールの表現・検証 |
+| API層 | `Pydantic BaseModel` | シリアライズ・バリデーション・OpenAPI生成 |
+
+ドメイン型は Pydantic を知らず、Pydantic スキーマはドメインロジックを持たない。
 
 ---
 
 ## 次のステップ
 
-Step 6が完了したら [Step 7: 在庫ロットの状態遷移API実装](./step07.md) へ進む。
+Step 6が完了したら [Step 7: 在庫ロット集約API](./step07.md) へ進む。

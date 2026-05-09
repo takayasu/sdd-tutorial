@@ -10,12 +10,12 @@ APIのエラーレスポンスを RFC 9457 Problem Details 形式に統一し、
 
 - Step 7までの実装では、エラーレスポンスの形式がエンドポイントごとにバラバラになりがち。`{"error":"..."}` だったり `{"message":"..."}` だったり、ステータスコードも不統一になる
 - RFC 9457 Problem Details は「APIエラーレスポンスの標準形式」として広く採用されており、フロントエンドやAPI利用者が一貫した方法でエラーを処理できる
-- Bean Validation（`@NotNull`, `@Size` 等のアノテーション）の代わりに、型レベルで不正な値を作れない設計にする。これにより「バリデーションを書き忘れる」というバグが構造的に発生しなくなる
+- `@field_validator` の代わりに、型レベルで不正な値を作れない設計にする。これにより「バリデーションを書き忘れる」というバグが構造的に発生しなくなる
 
 ### 何がうれしいのか
 
 - 全てのAPIエラーが同じJSON構造で返るため、フロントエンド側のエラーハンドリングが1箇所で済む
-- 「金額がマイナス」「数量がゼロ」といった不正な値が、型の生成時点で弾かれる。コンパイルが通った時点で、不正な値がドメインロジックに到達しないことが保証される
+- 「金額がマイナス」「数量がゼロ」といった不正な値が、型の生成時点で弾かれる。Pydantic のバリデーションが通った時点で、不正な値がドメインロジックに到達しないことが保証される
 - 複数のバリデーションエラーを一度に返せる（「金額が不正」と「数量が不正」を同時に通知）
 
 ## 完了条件
@@ -123,7 +123,7 @@ POST /lots/2024-A-001/instruct-shipping
 }
 ```
 
-これは2つのターミナルから同じロットを操作することで確認できる。DB側は `UPDATE ... WHERE version = @expected RETURNING version` で実装し、affected rows が 0 なら競合と判定する。
+これは2つのターミナルから同じロットを操作することで確認できる。DB側は `UPDATE ... WHERE version = :expected RETURNING version` で実装し、affected rows が 0 なら競合と判定する。
 
 ---
 
@@ -134,49 +134,205 @@ POST /lots/2024-A-001/instruct-shipping
 ```
 APIリクエスト
   → ルーティング
-    → ドメインロジック（Result / Either を返す）
-      → Ok → 200 + JSONレスポンス
-      → Error → DomainError を ProblemDetails に変換
+    → ドメインロジック（raise DomainError）
+      → 正常 → 200 + JSONレスポンス
+      → DomainError → exception_handler で ProblemDetails に変換
+    → Pydantic ValidationError → exception_handler → 400 ProblemDetails
     → 未処理例外 → グローバルエラーハンドラ → 500 ProblemDetails
 ```
 
-### F#
+### Python / FastAPI (Backend)
 
 | 要素 | 実装方法 |
 |---|---|
-| Problem Details | ASP.NET Core `Results.Problem()` or 自前の `ProblemDetails` レコード |
-| グローバルエラーハンドラ | Giraffe `ErrorHandler` |
-| Result → HTTP変換 | 共通の `toApiResponse` 関数 |
-| Smart Constructor | `type PositiveAmount = private PositiveAmount of int` + `create` 関数 |
-| エラー蓄積 | `FsToolkit.ErrorHandling` の `validation { }` CE（Applicative 合成） |
+| Problem Details | `JSONResponse` + `media_type="application/problem+json"` |
+| グローバルエラーハンドラ | `app.add_exception_handler(DomainError, handler)` |
+| DomainError → HTTP変換 | ハンドラ内で `error_type` → `status` をマッピング |
+| Smart Constructor | Pydantic `Annotated` + `Field(gt=0)` / `min_length=1` |
+| エラー蓄積 | Pydantic `ValidationError`（全フィールドを一括検証） |
 
-主な作業:
-1. `DomainError` 型を定義（`NotFound`, `ValidationFailed`, `InvalidStateTransition`, `OptimisticLockConflict` 等）
-2. `DomainError → ProblemDetails` の変換関数を作成（`OptimisticLockConflict` → `409 Conflict`）
-3. 全APIハンドラで `Result` を返し、共通の変換関数でレスポンスに変換
-4. `PositiveAmount`, `NonEmptyString` 等の Smart Constructor を作成
-5. ロット作成APIの入力バリデーションを Smart Constructor で実装
-6. 全テーブルに `version INT NOT NULL DEFAULT 1` カラムを追加（マイグレーション: F# `migrations/V004__add_version_column.sql` / Kotlin `V004__add_version_column.sql`）
-7. UPDATE 文に `WHERE version = @expected` を追加し、affected rows = 0 なら `OptimisticLockConflict` を返す
+#### `backend/src/domain/errors.py`
 
-### Kotlin
+```python
+from enum import StrEnum
 
-| 要素 | 実装方法 |
-|---|---|
-| Problem Details | `data class ProblemDetail(...)` + Ktor ContentNegotiation |
-| グローバルエラーハンドラ | Ktor `StatusPages` plugin |
-| Either → HTTP変換 | `ApplicationCall.respondEither()` 拡張関数 |
-| Smart Constructor | `@JvmInline value class PositiveAmount private constructor(...)` + `create` |
-| エラー蓄積 | Arrow `zipOrAccumulate` / `ValidatedNel` |
 
-主な作業:
-1. `DomainError` sealed interface を定義（`OptimisticLockConflict` を含む）
-2. `StatusPages` plugin で例外 → ProblemDetails 変換を設定（`OptimisticLockConflict` → `409`）
-3. `respondEither()` 拡張関数を作成し、全APIハンドラで使用
-4. Arrow の `zipOrAccumulate` で複数バリデーションエラーを蓄積
-5. ロット作成APIの入力バリデーションを Smart Constructor で実装
-6. 全テーブルに `version INT NOT NULL DEFAULT 1` カラムを追加（マイグレーションファイルは上記 F# と同様）
-7. Exposed の `update` で `where { version eq expected }` を追加し、更新件数 0 なら `OptimisticLockConflict`
+class DomainErrorType(StrEnum):
+    NOT_FOUND = "not-found"
+    INVALID_STATE_TRANSITION = "invalid-state-transition"
+    VALIDATION_ERROR = "validation-error"
+    OPTIMISTIC_LOCK_CONFLICT = "optimistic-lock-conflict"
+
+
+class DomainError(Exception):
+    def __init__(self, error_type: DomainErrorType, detail: str) -> None:
+        self.error_type = error_type
+        self.detail = detail
+        super().__init__(detail)
+```
+
+#### `backend/src/middleware/error_handler.py`
+
+```python
+from fastapi import Request
+from fastapi.responses import JSONResponse
+from pydantic import ValidationError
+
+from src.domain.errors import DomainError, DomainErrorType
+
+_STATUS_MAP = {
+    DomainErrorType.NOT_FOUND: 404,
+    DomainErrorType.INVALID_STATE_TRANSITION: 400,
+    DomainErrorType.VALIDATION_ERROR: 400,
+    DomainErrorType.OPTIMISTIC_LOCK_CONFLICT: 409,
+}
+
+_TITLE_MAP = {
+    DomainErrorType.NOT_FOUND: "Resource not found",
+    DomainErrorType.INVALID_STATE_TRANSITION: "Invalid state transition",
+    DomainErrorType.VALIDATION_ERROR: "Validation failed",
+    DomainErrorType.OPTIMISTIC_LOCK_CONFLICT: "Resource was modified by another user",
+}
+
+
+async def domain_error_handler(request: Request, exc: DomainError) -> JSONResponse:
+    status = _STATUS_MAP.get(exc.error_type, 400)
+    return JSONResponse(
+        status_code=status,
+        media_type="application/problem+json",
+        content={
+            "type": exc.error_type,
+            "title": _TITLE_MAP.get(exc.error_type, "Error"),
+            "status": status,
+            "detail": exc.detail,
+        },
+    )
+
+
+async def validation_error_handler(request: Request, exc: ValidationError) -> JSONResponse:
+    errors = [
+        {"field": ".".join(str(loc) for loc in e["loc"]), "message": e["msg"]}
+        for e in exc.errors()
+    ]
+    return JSONResponse(
+        status_code=400,
+        media_type="application/problem+json",
+        content={
+            "type": "validation-error",
+            "title": "Validation failed",
+            "status": 400,
+            "errors": errors,
+        },
+    )
+
+
+async def unhandled_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    return JSONResponse(
+        status_code=500,
+        media_type="application/problem+json",
+        content={
+            "type": "internal-server-error",
+            "title": "An unexpected error occurred",
+            "status": 500,
+            "detail": "Please contact support.",
+        },
+    )
+```
+
+#### `backend/src/main.py` への追記
+
+```python
+from pydantic import ValidationError
+from src.domain.errors import DomainError
+from src.middleware.error_handler import (
+    domain_error_handler,
+    validation_error_handler,
+    unhandled_error_handler,
+)
+
+app.add_exception_handler(DomainError, domain_error_handler)
+app.add_exception_handler(ValidationError, validation_error_handler)
+app.add_exception_handler(Exception, unhandled_error_handler)
+```
+
+#### Smart Constructor の例 (`backend/src/domain/models.py`)
+
+```python
+from typing import Annotated
+from pydantic import BaseModel, Field
+
+
+PositiveInt = Annotated[int, Field(gt=0)]
+NonEmptyStr = Annotated[str, Field(min_length=1)]
+
+
+class LotNumberInput(BaseModel):
+    year: PositiveInt
+    location: NonEmptyStr
+    seq: PositiveInt
+
+
+class CreateLotInput(BaseModel):
+    lot_number: LotNumberInput
+    quantity: PositiveInt
+```
+
+Pydantic は全フィールドを一括検証するため、`year`, `location`, `seq`, `quantity` が全て不正でも一度に全エラーが `ValidationError` に蓄積される。
+
+#### 楽観的ロック (SQLAlchemy)
+
+```python
+from sqlalchemy import update
+from src.domain.errors import DomainError, DomainErrorType
+
+
+async def update_lot_status(
+    lot_id: str, new_status: str, expected_version: int, session
+) -> None:
+    result = await session.execute(
+        update(LotTable)
+        .where(LotTable.id == lot_id, LotTable.version == expected_version)
+        .values(status=new_status, version=LotTable.version + 1)
+        .returning(LotTable.version)
+    )
+    if result.rowcount == 0:
+        raise DomainError(
+            DomainErrorType.OPTIMISTIC_LOCK_CONFLICT,
+            f"Lot {lot_id} has been updated. Please reload and try again.",
+        )
+```
+
+全テーブルに `version INTEGER NOT NULL DEFAULT 1` カラムを追加する（マイグレーション: `migrations/V004__add_version_column.sql`）。
+
+### TypeScript / React (Frontend)
+
+フロントエンドでは `application/problem+json` を統一的にハンドリングする。
+
+```typescript
+// src/lib/api-client.ts
+export type ProblemDetail = {
+  type: string
+  title: string
+  status: number
+  detail?: string
+  errors?: Array<{ field: string; message: string }>
+}
+
+export class ApiError extends Error {
+  constructor(public readonly problem: ProblemDetail) {
+    super(problem.detail ?? problem.title)
+  }
+}
+
+async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(url, init)
+  if (!res.ok) {
+    const problem: ProblemDetail = await res.json()
+    throw new ApiError(problem)
+  }
+  return res.json() as Promise<T>
+}
+```
 
 ---
 

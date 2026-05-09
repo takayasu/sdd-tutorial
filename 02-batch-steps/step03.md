@@ -25,9 +25,7 @@
 1. バッチを実行すると、`batch_job_execution` にレコードが作成されること:
 
 ```bash
-dotnet run --project tools/BatchRunner -- --job=monthly-close --date=2026-04
-# or
-gradle run --args="--job=monthly-close --date=2026-04"
+uv run python -m batch.runner --job=monthly-close --date=2026-04
 
 docker compose exec db psql -U app -d sales_management \
   -c "SELECT job_name, job_params, status, read_count, write_count, started_at, completed_at FROM batch_job_execution;"
@@ -39,7 +37,7 @@ docker compose exec db psql -U app -d sales_management \
 2. 同一パラメータで再実行すると拒否されること:
 
 ```bash
-dotnet run --project tools/BatchRunner -- --job=monthly-close --date=2026-04
+uv run python -m batch.runner --job=monthly-close --date=2026-04
 # → "Job 'monthly-close' with params '2026-04' already completed"
 # 終了コード: 0（エラーではない）
 ```
@@ -47,7 +45,7 @@ dotnet run --project tools/BatchRunner -- --job=monthly-close --date=2026-04
 3. 異なるパラメータなら実行できること:
 
 ```bash
-dotnet run --project tools/BatchRunner -- --job=monthly-close --date=2026-05
+uv run python -m batch.runner --job=monthly-close --date=2026-05
 # → 正常に実行される（別のジョブインスタンス）
 ```
 
@@ -57,10 +55,10 @@ dotnet run --project tools/BatchRunner -- --job=monthly-close --date=2026-05
 
 ```bash
 # ターミナル1（先に開始）
-dotnet run --project tools/BatchRunner -- --job=monthly-close --date=2026-06
+uv run python -m batch.runner --job=monthly-close --date=2026-06
 
 # ターミナル2（ターミナル1の実行中に）
-dotnet run --project tools/BatchRunner -- --job=monthly-close --date=2026-06
+uv run python -m batch.runner --job=monthly-close --date=2026-06
 # → "Job 'monthly-close' with params '2026-06' is already running"
 ```
 
@@ -82,7 +80,7 @@ dotnet run --project tools/BatchRunner -- --job=monthly-close --date=2026-06
 
 ## 実装ガイド
 
-### tryStart 関数
+### try_start 関数
 
 ```
 起動時の判定ロジック:
@@ -98,27 +96,138 @@ dotnet run --project tools/BatchRunner -- --job=monthly-close --date=2026-06
 ```sql
 UPDATE batch_job_execution
 SET status = 'RUNNING', started_at = NOW(), error_message = NULL
-WHERE job_name = @name AND job_params = @params AND status = 'FAILED'
+WHERE job_name = :name AND job_params = :params AND status = 'FAILED'
 RETURNING *;
 ```
 
 affected rows = 0 なら「別プロセスが先にリスタート済み」と判定し、拒否する。5 の INSERT も `ON CONFLICT DO NOTHING` + affected rows チェックで同様に対処する。
 
-### runBatch 関数（Step 2 の processInChunks をラップ）
+### Python / SQLAlchemy での実装
 
+```python
+# batch/job_execution.py
+from enum import StrEnum
+
+import structlog
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+logger = structlog.get_logger()
+
+
+class StartResult(StrEnum):
+    STARTED = "started"
+    RESTARTING = "restarting"
+    ALREADY_RUNNING = "already_running"
+    ALREADY_COMPLETED = "already_completed"
+
+
+async def try_start(session: AsyncSession, job_name: str, job_params: str) -> StartResult:
+    result = await session.execute(
+        text("SELECT status FROM batch_job_execution WHERE job_name = :name AND job_params = :params"),
+        {"name": job_name, "params": job_params},
+    )
+    row = result.fetchone()
+
+    if row is None:
+        ins = await session.execute(
+            text(
+                "INSERT INTO batch_job_execution (job_name, job_params) "
+                "VALUES (:name, :params) ON CONFLICT DO NOTHING RETURNING *"
+            ),
+            {"name": job_name, "params": job_params},
+        )
+        await session.commit()
+        return StartResult.STARTED if ins.rowcount > 0 else StartResult.ALREADY_RUNNING
+
+    if row.status == "RUNNING":
+        return StartResult.ALREADY_RUNNING
+    if row.status == "COMPLETED":
+        return StartResult.ALREADY_COMPLETED
+
+    # FAILED → restart
+    upd = await session.execute(
+        text(
+            "UPDATE batch_job_execution SET status = 'RUNNING', started_at = NOW(), error_message = NULL "
+            "WHERE job_name = :name AND job_params = :params AND status = 'FAILED' RETURNING *"
+        ),
+        {"name": job_name, "params": job_params},
+    )
+    await session.commit()
+    return StartResult.RESTARTING if upd.rowcount > 0 else StartResult.ALREADY_RUNNING
+
+
+async def complete_job(
+    session: AsyncSession, job_name: str, job_params: str,
+    read_count: int, write_count: int, skip_count: int,
+) -> None:
+    await session.execute(
+        text(
+            "UPDATE batch_job_execution "
+            "SET status = 'COMPLETED', completed_at = NOW(), "
+            "read_count = :read, write_count = :write, skip_count = :skip "
+            "WHERE job_name = :name AND job_params = :params"
+        ),
+        {"name": job_name, "params": job_params,
+         "read": read_count, "write": write_count, "skip": skip_count},
+    )
+    await session.commit()
+
+
+async def fail_job(session: AsyncSession, job_name: str, job_params: str, error: str) -> None:
+    await session.execute(
+        text(
+            "UPDATE batch_job_execution "
+            "SET status = 'FAILED', completed_at = NOW(), error_message = :error "
+            "WHERE job_name = :name AND job_params = :params"
+        ),
+        {"name": job_name, "params": job_params, "error": error},
+    )
+    await session.commit()
 ```
-runBatch:
-  1. tryStart() → 二重実行チェック
-  2. processInChunks() → チャンク処理（Step 2）
-  3. 正常完了 → completeJob()（status=COMPLETED, 件数記録）
-  4. 異常終了 → failJob()（status=FAILED, error_message記録）
+
+### run_batch 関数（Step 2 の process_in_chunks をラップ）
+
+```python
+# batch/runner_base.py
+from collections.abc import Callable, AsyncGenerator
+from typing import TypeVar
+
+from sqlalchemy.ext.asyncio import AsyncSession
+from batch.chunk import process_in_chunks
+from batch.job_execution import try_start, complete_job, fail_job, StartResult
+
+T = TypeVar("T")
+R = TypeVar("R")
+
+
+async def run_batch(
+    session: AsyncSession,
+    job_name: str,
+    job_params: str,
+    chunk_size: int,
+    reader: Callable[[int, int], AsyncGenerator[T, None]],
+    processor: Callable[[T], R | None],
+    writer: Callable[[AsyncSession, list[R]], None],
+    get_id: Callable[[T], int],
+) -> bool:
+    result = await try_start(session, job_name, job_params)
+
+    if result == StartResult.ALREADY_RUNNING:
+        print(f"Job '{job_name}' with params '{job_params}' is already running")
+        return False
+    if result == StartResult.ALREADY_COMPLETED:
+        print(f"Job '{job_name}' with params '{job_params}' already completed")
+        return True
+
+    try:
+        total = await process_in_chunks(session, chunk_size, reader, processor, writer, get_id)
+        await complete_job(session, job_name, job_params, total, total, 0)
+        return True
+    except Exception as exc:
+        await fail_job(session, job_name, job_params, str(exc))
+        raise
 ```
-
-### F# / Kotlin 共通
-
-- `tryStart`, `completeJob`, `failJob` の3関数を実装
-- Step 2 の `processInChunks` を `runBatch` でラップ
-- バッチエントリポイントで `runBatch` を呼び出し、終了コードを返す
 
 ---
 

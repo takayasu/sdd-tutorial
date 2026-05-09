@@ -4,7 +4,7 @@
 
 ### これは何か
 
-このPoCで使うソフトウェア（プログラミング言語、ビルドツール、コンテナ環境など）を自分のPCにインストールする作業。
+このPoCで使うソフトウェア（プログラミング言語、ランタイム、コンテナ環境など）を自分のPCにインストールする作業。
 
 ### なぜやるのか
 
@@ -26,84 +26,80 @@ Docker version 27.x.x, build xxxxxxx   # 27以上
 $ docker compose version
 Docker Compose version v2.x.x          # v2以上
 
-$ dotnet --version
-8.0.xxx                                 # 8.0以上
+$ python --version
+Python 3.12.x                           # 3.12以上
 
-$ gradle --version
-Gradle 8.x                             # 8以上
+$ uv --version
+uv 0.x.x                               # 表示されればOK
 
-$ java --version
-openjdk 21.x.x                         # 21以上
+$ node --version
+v22.x.x                                # 22 LTS以上
+
+$ pnpm --version
+9.x.x                                  # 9以上
 
 $ gitleaks version
 v8.x.x                                 # 表示されればOK
 
 $ trivy --version
 Version: 0.x.x                          # 表示されればOK
-
-$ scc --version
-scc version x.x.x                       # 表示されればOK
 ```
 
 ---
 
-## F# 環境
+## Python 環境
 
-### 1. .NET SDK インストール
+### 1. Python インストール
 
 ```bash
 # Ubuntu/Debian
 sudo apt-get update
-sudo apt-get install -y dotnet-sdk-8.0
+sudo apt-get install -y python3.12 python3.12-venv
 
-# macOS
-brew install dotnet-sdk
+# macOS（pyenv推奨）
+brew install pyenv
+pyenv install 3.12
+pyenv global 3.12
 
 # 確認
-dotnet --version
+python --version
 ```
 
-### 2. ツールのインストール
+### 2. uv インストール（パッケージ管理）
+
+`uv` は Rust 製の高速Pythonパッケージマネージャ。`pip` + `venv` を置き換える。
 
 ```bash
-# Fantomas（フォーマッター）
-dotnet tool install -g fantomas
-
-# FSharpLint（リンター）
-dotnet tool install -g dotnet-fsharplint
+# macOS / Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # 確認
-dotnet fantomas --version
-dotnet fsharplint --version
+uv --version
 ```
 
 ---
 
-## Kotlin 環境
+## Node.js 環境（フロントエンド）
 
-### 1. JDK インストール
+### 1. Node.js インストール
 
 ```bash
-# Ubuntu/Debian
-sudo apt-get install -y openjdk-21-jdk
-
-# macOS
-brew install openjdk@21
+# fnm（高速なバージョンマネージャ）推奨
+curl -fsSL https://fnm.vercel.app/install | bash
+fnm install 22
+fnm use 22
 
 # 確認
-java --version
+node --version
 ```
 
-### 2. Gradle インストール
+### 2. pnpm インストール
 
 ```bash
-# SDKMAN推奨
-curl -s "https://get.sdkman.io" | bash
-source "$HOME/.sdkman/bin/sdkman-init.sh"
-sdk install gradle
+npm install -g pnpm
 
 # 確認
-gradle --version
+pnpm --version
 ```
 
 ---
@@ -149,17 +145,33 @@ sudo apt-get install -y trivy
 trivy --version
 ```
 
-### scc（F#用の複雑度予約）
+---
 
-```bash
-# macOS
-brew install scc
+## プロジェクト構成（全体像）
 
-# Linux
-go install github.com/boyter/scc/v3@latest
-
-# 確認
-scc --version
+```
+sales-management/
+├── backend/                   # Python + FastAPI
+│   ├── src/
+│   │   ├── domain/            # 型定義 + 純粋関数（ドメインロジック）
+│   │   ├── infra/             # DB リポジトリ（SQLAlchemy）
+│   │   └── api/               # FastAPI ルーティング
+│   ├── tests/
+│   │   ├── domain/            # ドメインロジックのPBT
+│   │   └── api/               # APIの統合テスト
+│   ├── alembic/               # DBマイグレーション
+│   ├── pyproject.toml
+│   └── alembic.ini
+├── frontend/                  # React + TypeScript + Vite
+│   ├── src/
+│   │   ├── domain/            # TypeScript 型定義
+│   │   ├── api/               # APIクライアント（openapi-typescript生成）
+│   │   └── pages/             # React ページコンポーネント
+│   ├── tests/
+│   ├── package.json
+│   └── vite.config.ts
+├── docker-compose.yml
+└── ci.sh
 ```
 
 ---

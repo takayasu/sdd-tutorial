@@ -6,8 +6,7 @@
 
 CIの実行結果を時系列で可視化するダッシュボードを構築する。ダッシュボードとは、カバレッジ率・コード複雑度・脆弱性数などのメトリクスをグラフで表示する画面。
 
-- F#: Grafana（汎用ダッシュボードツール。CI出力のJSONを取り込む）
-- Kotlin: SonarQube（Step 11で導入済み。コード品質に特化したダッシュボード）
+Step 2 の docker-compose.yml にはすでに Grafana が含まれている。ここでは CI が出力する JSON を Grafana で読み取り、品質推移グラフを表示できるようにする。
 
 ### なぜやるのか
 
@@ -23,29 +22,8 @@ CIの実行結果を時系列で可視化するダッシュボードを構築す
 
 ## 完了条件
 
-### Kotlin（SonarQube）
-
 ```bash
-# SonarQubeが起動していること
-$ curl -s http://localhost:9000/api/system/status | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])"
-UP
-
-# 解析実行後、ダッシュボードにメトリクスが表示されること
-$ gradle sonar
-BUILD SUCCESSFUL in Xs
-
-# ブラウザで http://localhost:9000 にアクセスし、以下が確認できること：
-# - カバレッジ率
-# - 循環的複雑度
-# - コード重複率
-# - 脆弱性数
-# - 技術的負債
-```
-
-### F#（Grafana）
-
-```bash
-# Grafanaが起動していること
+# Grafanaが起動していること（Step 2から継続）
 $ curl -s http://localhost:3000/api/health
 {"commit":"...","database":"ok","version":"..."}
 
@@ -54,7 +32,7 @@ $ ./ci.sh
 === CI完了 ===
 
 $ ls ci-results/
-coverage.json  lint.json  scc_2024-04-20T10:00:00Z.json
+coverage_2024-04-20T10:00:00Z.json  complexity_2024-04-20T10:00:00Z.json  lint_2024-04-20T10:00:00Z.json
 
 # ブラウザで http://localhost:3000 にアクセスし（admin/admin）、
 # ダッシュボードにカバレッジ推移等のグラフが表示されること
@@ -62,40 +40,112 @@ coverage.json  lint.json  scc_2024-04-20T10:00:00Z.json
 
 ---
 
-## Kotlin（SonarQube ダッシュボード活用）
+## 追加パッケージ
 
-Step 11でSonarQubeは導入済み。ここでは品質ゲートとダッシュボードの設定に集中する。
+```toml
+# backend/pyproject.toml の [project.optional-dependencies] に追加
+[project.optional-dependencies]
+dev = [
+    # ... 既存 ...
+    "radon>=6.0",          # 循環的複雑度
+    "pytest-json-report",  # pytest JSON出力
+]
+```
 
-### 1. 品質ゲート設定
-
-ブラウザで http://localhost:9000 にアクセスし、以下を設定：
-
-- Quality Gate → 新規作成 or デフォルト編集
-  - カバレッジ: 80%以上
-  - 重複率: 3%以下
-  - 脆弱性: 0
-  - バグ: 0
-  - コードスメル: A評価
-
-### 2. 確認するメトリクス
-
-| メトリクス | 確認内容 |
-|---|---|
-| カバレッジ | PBTでどの程度カバーされているか |
-| 循環的複雑度 | 関数の複雑さ |
-| 認知的複雑度 | 可読性の指標 |
-| コード重複率 | DRY原則の遵守 |
-| 脆弱性 | SAST検出結果 |
-| 技術的負債 | 修正にかかる推定時間 |
+```bash
+cd backend && uv pip install radon pytest-json-report
+```
 
 ---
 
-## F#（Grafana + CI出力JSON）
+## CI結果をJSONで出力
 
-### 1. docker-compose.yml にGrafanaを追加
+### ci.sh の更新（JSON出力追加）
+
+```bash
+#!/bin/bash
+set -e
+
+RESULTS_DIR="./ci-results"
+mkdir -p "$RESULTS_DIR"
+TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+echo "=== マイグレーション ==="
+cd backend && alembic upgrade head && cd ..
+
+echo "=== フォーマットチェック (ruff) ==="
+cd backend && uv run ruff format --check src/ && cd ..
+
+echo "=== リンター (ruff) ==="
+cd backend && uv run ruff check src/ && cd ..
+
+echo "=== テスト + カバレッジ ==="
+cd backend
+uv run pytest tests/ \
+  --cov=src \
+  --cov-branch \
+  --cov-fail-under=80 \
+  --cov-report=json:../ci-results/coverage_raw.json \
+  --json-report --json-report-file=../ci-results/pytest_${TIMESTAMP}.json \
+  -q
+COVERAGE=$(python -c "import json; d=json.load(open('../ci-results/coverage_raw.json')); print(round(d['totals']['percent_covered'], 2))")
+echo "{\"timestamp\": \"$TIMESTAMP\", \"coverage\": $COVERAGE}" \
+  >> "../$RESULTS_DIR/coverage_${TIMESTAMP}.json"
+cd ..
+
+echo "=== 複雑度 (radon) ==="
+cd backend
+COMPLEXITY=$(uv run python -m radon cc src/ -j)
+echo "{\"timestamp\": \"$TIMESTAMP\", \"complexity\": $COMPLEXITY}" \
+  > "../$RESULTS_DIR/complexity_${TIMESTAMP}.json"
+cd ..
+
+echo "=== 型チェック (mypy) ==="
+cd backend && uv run mypy src/ --strict && cd ..
+
+echo "=== フロントエンド型チェック ==="
+cd frontend && pnpm tsc --noEmit && cd ..
+
+echo "=== フロントエンドテスト + カバレッジ ==="
+cd frontend
+pnpm vitest run --coverage.enabled true \
+  --reporter=json --outputFile=../ci-results/vitest_${TIMESTAMP}.json
+cd ..
+
+echo "=== シークレット検出 ==="
+gitleaks detect --source . --exit-code 1
+
+echo "=== パッケージ脆弱性スキャン ==="
+cd backend && uv run pip-audit --format json -o ../ci-results/pip_audit_${TIMESTAMP}.json; cd ..
+cd frontend && pnpm audit --audit-level=high; cd ..
+
+echo "=== SAST ==="
+cd backend && uv run bandit -r src/ -ll -ii -f json \
+  -o ../ci-results/bandit_${TIMESTAMP}.json; cd ..
+
+echo "=== 予約・委託・品目変換 API 検証 ==="
+# Step 18 完了条件の確認（サービス起動済み前提）
+STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+  -X POST http://localhost:8000/sales-cases/2/reservation/appraisals \
+  -H "Content-Type: application/json" \
+  -d '{"appraisal_date":"2024-04-05","estimated_lot_info":"A商品 10本","estimated_amount":300000,"version":1}')
+[ "$STATUS" = "200" ] || [ "$STATUS" = "201" ] && echo "PASS reservation-appraisal-create"
+
+echo "{\"timestamp\": \"$TIMESTAMP\", \"status\": \"success\"}" \
+  > "$RESULTS_DIR/lint_${TIMESTAMP}.json"
+
+echo "=== CI完了 ==="
+```
+
+---
+
+## Grafana ダッシュボード設定
+
+### docker-compose.yml（Step 2 から継続・確認）
+
+Step 2 で追加済みの Grafana サービスに `ci-results` ボリュームマウントを追加する：
 
 ```yaml
-# fsharp/docker-compose.yml に追加
 services:
   grafana:
     image: grafana/grafana:latest
@@ -106,117 +156,58 @@ services:
     volumes:
       - grafana_data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning
-      - ./ci-results:/var/lib/grafana/ci-results
+      - ./ci-results:/var/lib/grafana/ci-results  # ← 追加
 
 volumes:
   grafana_data:
 ```
 
-### 2. CI結果をJSONで出力
+### ダッシュボード作成手順
 
-ci.sh の各ステップでJSON出力を追加：
+1. ブラウザで http://localhost:3000 にアクセス（admin/admin）
+2. **Connections** → **Add new data source** → **JSON API** プラグインを追加
+3. **Dashboards** → **New dashboard** → **Add visualization**
+4. 以下のパネルを追加：
 
-```bash
-#!/bin/bash
-set -e
-
-RESULTS_DIR="./ci-results"
-mkdir -p "$RESULTS_DIR"
-TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-# カバレッジ結果をJSON化
-echo "=== テスト + カバレッジ ==="
-dotnet test --collect:"XPlat Code Coverage" --results-directory ./coverage
-COVERAGE=$(grep -oP 'line-rate="\K[^"]+' coverage/**/coverage.cobertura.xml | head -1)
-echo "{\"timestamp\": \"$TIMESTAMP\", \"coverage\": $COVERAGE}" >> "$RESULTS_DIR/coverage.json"
-
-# scc結果
-echo "=== 複雑度 ==="
-scc --by-file --format json src/ > "$RESULTS_DIR/scc_$TIMESTAMP.json"
-
-# リンター結果
-echo "=== リンター ==="
-LINT_WARNINGS=$(dotnet tool run fsharplint lint src/SalesManagement/SalesManagement.fsproj 2>&1 | grep -c "Warning" || echo "0")
-echo "{\"timestamp\": \"$TIMESTAMP\", \"lint_warnings\": $LINT_WARNINGS}" >> "$RESULTS_DIR/lint.json"
-```
-
-### 3. Grafanaダッシュボード設定
-
-ブラウザで http://localhost:3000 にアクセス（admin/admin）：
-
-1. Data Source → JSON API plugin を追加
-2. Dashboard → 新規作成
-3. パネル追加：
-   - カバレッジ推移（折れ線グラフ）
-   - リンター警告数推移
-   - コード行数推移（scc）
+| パネル名 | データソース | 可視化 |
+|---|---|---|
+| カバレッジ推移 | `ci-results/coverage_*.json` の `coverage` フィールド | 折れ線グラフ |
+| 複雑度分布 | `ci-results/complexity_*.json` の `complexity` | 棒グラフ |
+| CIステータス | `ci-results/lint_*.json` の `status` | ステートマップ |
 
 ---
 
-## ci.sh の最終構成（F#）
+## 確認するメトリクス
+
+| メトリクス | ツール | 確認内容 |
+|---|---|---|
+| カバレッジ率 | pytest-cov | PBTでどの程度カバーされているか（80%以上） |
+| 循環的複雑度 | radon | 関数の複雑さ（A/B/C/D/E/F評価） |
+| SAST指摘数 | bandit | セキュリティ問題の件数 |
+| 脆弱性数 | pip-audit / pnpm audit | OSS依存の既知CVE |
+| 型エラー数 | mypy / tsc | 型安全性の状態 |
+
+---
+
+## radon 複雑度の見方
 
 ```bash
-#!/bin/bash
-set -e
+# 循環的複雑度（CC）をファイル別に表示
+cd backend && uv run python -m radon cc src/ -s
 
-echo "=== マイグレーション ==="
-dotnet run --project tools/Migrator
+# 結果例：
+# src/domain/sales_case_workflows.py
+#     F 14:0 conclude_contract - A (2)
+#     F 22:0 instruct_shipping - A (3)
+# src/routers/sales_cases.py
+#     F 45:0 create_appraisal - B (6)
 
-echo "=== ビルド ==="
-dotnet build --warnaserror
-
-echo "=== フォーマットチェック ==="
-dotnet fantomas --check src/
-
-echo "=== リンター ==="
-dotnet tool run fsharplint lint src/SalesManagement/SalesManagement.fsproj
-
-echo "=== テスト + カバレッジ ==="
-dotnet test --collect:"XPlat Code Coverage" --results-directory ./coverage
-
-echo "=== 複雑度 ==="
-scc --by-file --format json src/
-
-echo "=== シークレット検出 ==="
-gitleaks detect --source . --exit-code 1
-
-echo "=== パッケージ脆弱性スキャン ==="
-trivy fs --scanners vuln --severity HIGH,CRITICAL .
-
-echo "=== CI完了 ==="
-```
-
-## ci.sh の最終構成（Kotlin）
-
-```bash
-#!/bin/bash
-set -e
-
-echo "=== マイグレーション ==="
-gradle flywayMigrate
-
-echo "=== ビルド ==="
-gradle build
-
-echo "=== フォーマットチェック ==="
-gradle ktfmtCheck
-
-echo "=== リンター ==="
-gradle detekt
-
-echo "=== テスト + カバレッジ ==="
-gradle test jacocoTestReport
-
-echo "=== SAST (SonarQube) ==="
-gradle sonar
-
-echo "=== シークレット検出 ==="
-gitleaks detect --source . --exit-code 1
-
-echo "=== パッケージ脆弱性スキャン ==="
-trivy fs --scanners vuln --severity HIGH,CRITICAL .
-
-echo "=== CI完了 ==="
+# グレード基準:
+# A: 1-5  （単純、リスク低）
+# B: 6-10 （少し複雑）
+# C: 11-15（やや複雑、要注意）
+# D: 16-20（複雑、リファクタ推奨）
+# F: 21+  （非常に複雑、要リファクタ）
 ```
 
 ---

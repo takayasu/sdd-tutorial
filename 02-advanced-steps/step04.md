@@ -9,13 +9,12 @@
 ### なぜやるのか
 
 - k8s や ECS のヘルスチェック（liveness / readiness probe）は、アプリが「生きているか」「リクエストを受け付けられるか」を判定するためにHTTPエンドポイントを叩く。これがないとコンテナオーケストレータがアプリの異常を検知できない
-- Spring Boot Actuator の `/health` に相当する機能を自前で実装する
 - OpenAPI仕様書があると、フロントエンド開発者やAPI利用者が「どんなエンドポイントがあるか」「リクエスト/レスポンスの形式は何か」をブラウザで確認できる
 
 ### 何がうれしいのか
 
 - ブラウザで `/health` を開くと、アプリとDBの状態が一目でわかる。DBが落ちていれば `"status": "DOWN"` と表示される
-- ブラウザで `/swagger` を開くと、全APIの一覧が表示され、その場でリクエストを試せる。Postmanやcurlでの手動テストが不要になる
+- FastAPI は `/docs`（Swagger UI）と `/redoc` を標準で提供する。Pydantic モデルから自動生成されるため、仕様書とコードが常に一致する
 - k8sのreadinessProbeに `/health` を設定すれば、DB接続が切れたときに自動的にトラフィックが止まる
 
 ## 完了条件
@@ -68,56 +67,130 @@ GET /health
 ### OpenAPIの確認
 
 4. ブラウザで Swagger UI にアクセスできること:
-   - F#: `http://localhost:5000/swagger`
-   - Kotlin: `http://localhost:8080/swagger`
+   - `http://localhost:8000/docs`
 
 5. Swagger UI に以下が表示されていること:
    - 全てのAPIエンドポイント（GET /lots, POST /lots, POST /lots/{id}/complete-manufacturing 等）
    - リクエストボディのスキーマ（どんなJSONを送ればいいか）
    - レスポンスのスキーマ（どんなJSONが返ってくるか）
-   - 認証が必要なエンドポイントには鍵マークが表示される
+   - 認証が必要なエンドポイントには鍵マークが表示される（`bearerAuth` スキーム）
 
 6. Swagger UI の「Try it out」ボタンでAPIを実際に叩けること
 
 ### 確認のコツ
 
 - ヘルスチェックは認証不要にすること（k8sのprobeは認証トークンを持たない）
-- `/health` のレスポンスタイムが遅い場合、DBへのSELECT 1が遅い可能性がある。コネクションプールの設定を確認する
-- OpenAPIのJSON仕様は `/swagger/v1/swagger.json`（F#）や `/openapi.json`（Kotlin）で取得できる。これをフロントエンドのコード生成ツールに渡すこともできる
+- `/health` のレスポンスタイムが遅い場合、DBへの `SELECT 1` が遅い可能性がある。コネクションプールの設定を確認する
+- OpenAPIのJSON仕様は `http://localhost:8000/openapi.json` で取得できる。フロントエンドのコード生成ツール（`openapi-typescript` 等）に渡すこともできる
 
 ---
 
 ## 実装ガイド
 
-### F#
+### Python / FastAPI (Backend)
 
 | 要素 | 実装方法 |
 |---|---|
-| ヘルスチェック | ASP.NET Core `AddHealthChecks().AddNpgSql()` |
-| Swagger UI | `Swashbuckle.AspNetCore` |
-| OpenAPI生成 | `AddEndpointsApiExplorer` + `AddSwaggerGen` |
+| ヘルスチェック | 自前エンドポイント（SQLAlchemy `SELECT 1`） |
+| Swagger UI | FastAPI 標準（`/docs`） |
+| ReDoc | FastAPI 標準（`/redoc`） |
+| OpenAPI JSON | FastAPI 標準（`/openapi.json`） |
+| 認証スキーム | `bearerAuth` を `custom_openapi` で追加済み（Step 18b 参照） |
 
-主な作業:
-1. NuGet で `AspNetCore.HealthChecks.NpgSql`, `Swashbuckle.AspNetCore` を追加
-2. `AddHealthChecks().AddNpgSql(connectionString)` でDB死活監視を登録
-3. `MapHealthChecks("/health")` でエンドポイントを公開
-4. `AddSwaggerGen` + `UseSwagger` + `UseSwaggerUI` を設定
-5. ヘルスチェックとSwaggerは認証の外に配置
+FastAPI は Pydantic モデルから OpenAPI スキーマを自動生成するため、別途アノテーションは不要。
 
-### Kotlin
+#### `backend/src/routers/health.py`
 
-| 要素 | 実装方法 |
-|---|---|
-| ヘルスチェック | 自前エンドポイント（DB接続チェック） |
-| Swagger UI | Ktor OpenAPI plugin or Kompendium |
-| メトリクス（任意） | `ktor-server-metrics-micrometer` + Prometheus |
+```python
+from fastapi import APIRouter, Depends
+from fastapi.responses import JSONResponse
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
-主な作業:
-1. `/health` エンドポイントを作成し、DB接続チェック（`SELECT 1`）を実行
-2. ステータスに応じて200 or 503を返す
-3. Ktor OpenAPI plugin を設定し、ルート定義にメタデータを付与
-4. Swagger UIを `/swagger` で公開
-5. ヘルスチェックとSwaggerは `authenticate` ブロックの外に配置
+from src.database import get_session
+
+router = APIRouter()
+
+
+@router.get("/health", include_in_schema=False)
+async def health(session: AsyncSession = Depends(get_session)) -> JSONResponse:
+    checks: dict[str, str] = {"self": "UP"}
+    try:
+        await session.execute(text("SELECT 1"))
+        checks["postgresql"] = "UP"
+    except Exception:
+        checks["postgresql"] = "DOWN"
+
+    overall = "UP" if all(v == "UP" for v in checks.values()) else "DOWN"
+    status_code = 200 if overall == "UP" else 503
+    return JSONResponse(
+        status_code=status_code,
+        content={"status": overall, "checks": checks},
+    )
+```
+
+#### `backend/src/main.py` への追記
+
+```python
+from src.routers import health
+
+app.include_router(health.router)
+```
+
+ヘルスチェックは `include_in_schema=False` で Swagger UI から非表示にし、認証ミドルウェアの依存なしで登録する。
+
+#### Swagger UI の認証スキーム（Step 18b の再掲）
+
+```python
+# backend/src/main.py
+from fastapi.openapi.utils import get_openapi
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(title=app.title, version=app.version, routes=app.routes)
+    schema.setdefault("components", {}).setdefault("securitySchemes", {})["bearerAuth"] = {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+    }
+    app.openapi_schema = schema
+    return schema
+
+app.openapi = custom_openapi
+```
+
+#### 動作確認
+
+```bash
+# Swagger UI
+open http://localhost:8000/docs
+
+# OpenAPI JSON（コード生成ツールに渡す）
+curl http://localhost:8000/openapi.json | jq .info
+
+# ヘルスチェック
+curl http://localhost:8000/health
+```
+
+### TypeScript / React (Frontend) — openapi-typescript によるコード生成
+
+OpenAPI JSON からフロントエンドの型定義を自動生成できる。
+
+```bash
+cd frontend
+pnpm add -D openapi-typescript
+pnpm openapi-typescript http://localhost:8000/openapi.json -o src/types/api.d.ts
+```
+
+生成された型を使ってリクエストを型安全に組み立てる:
+
+```typescript
+import type { paths } from "./types/api"
+
+type GetLotResponse =
+  paths["/lots/{lot_id}"]["get"]["responses"]["200"]["content"]["application/json"]
+```
 
 ---
 

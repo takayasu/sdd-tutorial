@@ -39,26 +39,26 @@ docker compose exec db psql -U app -d sales_management \
 
 ```bash
 # 並列実行
-dotnet run --project tools/BatchRunner -- --job=parallel-test --date=2026-04 --partitions=5
+uv run python -m batch.runner --job=parallel-test --date=2026-04 --partitions=5
 
 # ログでパーティション分割が確認できること
-# {"message":"Partitioning","totalCount":100000,"partitions":5,"ranges":["1-20000","20001-40000","40001-60000","60001-80000","80001-100000"]}
-# {"message":"Partition 1 completed","processed":20000,"elapsed":"3200ms"}
-# {"message":"Partition 3 completed","processed":20000,"elapsed":"3300ms"}
-# {"message":"Partition 2 completed","processed":20000,"elapsed":"3400ms"}
+# {"event":"Partitioning","total_count":100000,"partitions":5,"ranges":["1-20000","20001-40000","40001-60000","60001-80000","80001-100000"]}
+# {"event":"Partition completed","partition":1,"processed":20000,"elapsed_ms":3200}
+# {"event":"Partition completed","partition":3,"processed":20000,"elapsed_ms":3300}
+# {"event":"Partition completed","partition":2,"processed":20000,"elapsed_ms":3400}
 # ...（完了順序は不定）
-# {"message":"All partitions completed","totalProcessed":100000,"elapsed":"3500ms"}
+# {"event":"All partitions completed","total_processed":100000,"elapsed_ms":3500}
 ```
 
 2. 処理時間がシングルスレッドより短いこと:
 
 ```bash
 # シングルスレッド（比較用）
-time dotnet run --project tools/BatchRunner -- --job=single-test --date=2026-04 --partitions=1
+time uv run python -m batch.runner --job=single-test --date=2026-04 --partitions=1
 # → real 0m15.000s（例）
 
 # 5パーティション並列
-time dotnet run --project tools/BatchRunner -- --job=parallel-test --date=2026-04 --partitions=5
+time uv run python -m batch.runner --job=parallel-test --date=2026-04 --partitions=5
 # → real 0m4.000s（例、大幅に短縮）
 ```
 
@@ -68,7 +68,7 @@ time dotnet run --project tools/BatchRunner -- --job=parallel-test --date=2026-0
 
 ```bash
 # 実行（パーティション2で意図的にエラー）
-dotnet run --project tools/BatchRunner -- --job=partition-restart-test --date=2026-04 --partitions=5
+uv run python -m batch.runner --job=partition-restart-test --date=2026-04 --partitions=5
 # → パーティション0,1,3,4は完了、パーティション2はFAILED
 
 # 進捗確認
@@ -77,10 +77,10 @@ docker compose exec db psql -U app -d sales_management \
 # → partition_id=2 のみレコードが残る（他は完了済みで削除）
 
 # 再実行 → パーティション2だけ再開
-dotnet run --project tools/BatchRunner -- --job=partition-restart-test --date=2026-04 --partitions=5
-# → {"message":"Partition 0 already completed, skipping"}
-# → {"message":"Partition 1 already completed, skipping"}
-# → {"message":"Partition 2 restarting from last_processed_id=45000"}
+uv run python -m batch.runner --job=partition-restart-test --date=2026-04 --partitions=5
+# → {"event":"Partition already completed, skipping","partition":0}
+# → {"event":"Partition already completed, skipping","partition":1}
+# → {"event":"Partition restarting","partition":2,"last_processed_id":45000}
 # → ...
 ```
 
@@ -96,48 +96,67 @@ dotnet run --project tools/BatchRunner -- --job=partition-restart-test --date=20
 
 ### パーティション分割
 
-```fsharp
-// F#
-let partition (db: NpgsqlDataSource) (tableName: string) (partitionCount: int) =
-    let minMax = queryMinMaxId db tableName  // (minId, maxId)
-    let rangeSize = (snd minMax - fst minMax + 1L) / int64 partitionCount
-    [ for i in 0 .. partitionCount - 1 ->
-        let from = fst minMax + int64 i * rangeSize
-        let to' = if i = partitionCount - 1 then snd minMax else from + rangeSize - 1L
-        (i, from, to') ]
-```
+```python
+# batch/partitioner.py
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
-```kotlin
-// Kotlin
-fun partition(db: Database, partitionCount: Int): List<Triple<Int, Long, Long>> {
-    val (minId, maxId) = queryMinMaxId(db)
-    val rangeSize = (maxId - minId + 1) / partitionCount
-    return (0 until partitionCount).map { i ->
-        val from = minId + i * rangeSize
-        val to = if (i == partitionCount - 1) maxId else from + rangeSize - 1
-        Triple(i, from, to)
-    }
-}
+
+async def create_partitions(
+    session: AsyncSession, table: str, partition_count: int
+) -> list[tuple[int, int, int]]:
+    result = await session.execute(text(f"SELECT MIN(id), MAX(id) FROM {table}"))
+    row = result.fetchone()
+    min_id, max_id = row[0], row[1]
+
+    range_size = (max_id - min_id + 1) // partition_count
+    partitions = []
+    for i in range(partition_count):
+        from_id = min_id + i * range_size
+        to_id = max_id if i == partition_count - 1 else from_id + range_size - 1
+        partitions.append((i, from_id, to_id))
+    return partitions
 ```
 
 ### 並列実行
 
-```fsharp
-// F#: Async.Parallel
-partitions
-|> List.map (fun (partId, from, to') ->
-    async { processPartition db partId from to' })
-|> Async.Parallel
-|> Async.RunSynchronously
+```python
+# batch/parallel.py
+import asyncio
+from collections.abc import Callable, Awaitable
+
+from batch.partitioner import create_partitions
+from batch.database import AsyncSessionLocal
+
+
+async def process_partitions(
+    table: str,
+    partition_count: int,
+    process_partition: Callable[[int, int, int], Awaitable[int]],
+) -> int:
+    async with AsyncSessionLocal() as session:
+        partitions = await create_partitions(session, table, partition_count)
+
+    results = await asyncio.gather(
+        *[process_partition(part_id, from_id, to_id) for part_id, from_id, to_id in partitions]
+    )
+    return sum(results)
 ```
 
-```kotlin
-// Kotlin: coroutineScope + async
-coroutineScope {
-    partitions.map { (partId, from, to) ->
-        async { processPartition(db, partId, from, to) }
-    }.awaitAll()
-}
+```python
+# batch/runner.py での使用例
+from batch.parallel import process_partitions
+from batch.database import AsyncSessionLocal
+from batch.jobs.monthly_close import process_partition
+
+
+async def run_parallel_job(partitions: int) -> None:
+    async def run_one(part_id: int, from_id: int, to_id: int) -> int:
+        async with AsyncSessionLocal() as session:
+            return await process_partition(session, part_id, from_id, to_id)
+
+    total = await process_partitions("lot", partitions, run_one)
+    print(f"All partitions completed: {total} records processed")
 ```
 
 ---

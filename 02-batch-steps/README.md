@@ -1,6 +1,6 @@
-# Batch Steps: Spring Batch 機能の代替実装
+# Batch Steps: Spring Batch 機能の Python/SQLAlchemy 実装
 
-Spring Batch が業務バッチ処理に提供する機能を、F#（.NET）と Kotlin（JVM）で代替する。01-steps/ を全て完了した前提で、バッチ処理基盤として本番運用に耐えうるかを PoC する。
+Spring Batch が業務バッチ処理に提供する機能を、Python（SQLAlchemy + asyncio）で代替する。01-steps/ を全て完了した前提で、バッチ処理基盤として本番運用に耐えうるかを PoC する。
 
 Web API の業務システム機能については [02-advanced-steps/](../02-advanced-steps/) を参照。
 
@@ -17,7 +17,7 @@ Web API の業務システム機能については [02-advanced-steps/](../02-ad
 | チャンク処理・リスタート | アプリ側（DB） | バッチの核心。クラウドに渡すとロックイン |
 | 二重実行防止 | アプリ側（DB ロック） | クラウド機能に依存すると移行時に再実装が必要 |
 | リトライ（チャンク単位） | アプリ側 | チャンクリスタートがあればジョブ単位リトライで十分 |
-| 並列処理 | アプリ側（言語の並列機構） | Map State 等に依存しない |
+| 並列処理 | アプリ側（asyncio） | Map State 等に依存しない |
 | 処理件数記録 | アプリ側（DB） | 運用監視に必要 |
 | スケジューリング（Cron 起動） | クラウド（EventBridge 等） | cron 起動はどのクラウドにもある。k8s CronJob にも差し替え可 |
 | ジョブ起動・結果通知 | クラウド（Step Functions 等） | 薄いラッパー。なくても動く |
@@ -26,26 +26,26 @@ Web API の業務システム機能については [02-advanced-steps/](../02-ad
 ### 前提
 
 - 「Spring Batch の全機能再現」ではなく「業務バッチに必要な運用レベルの確保」が目的
-- 外部ライブラリ（Hangfire, Jobrunr 等）には依存しない
+- 外部ライブラリ（Celery, APScheduler 等）には依存しない
 - k8s Job 起動パターンでは Spring Batch の手動停止は実質無効、JobParameters の渡し方次第ではリスタートも無効の可能性がある
 
 ---
 
 ## 機能対応一覧
 
-| Spring Batch 機能 | F# (.NET) | Kotlin (JVM) | 実装場所 | Step |
-|---|---|---|---|---|
-| チャンク処理 | `Seq.chunkBySize` + トランザクション | `Sequence.chunked` + Exposed transaction | アプリ | [Step 2](./step02.md) |
-| ジョブ実行管理 | `batch_job_execution` テーブル + `runBatch` 関数 | 同左 | アプリ（DB） | [Step 3](./step03.md) |
-| 二重実行防止 | DB の PK 制約 + ステータスチェック | 同左 | アプリ（DB） | [Step 3](./step03.md) |
-| リスタート（オフセット再開） | `batch_chunk_progress` テーブル | 同左 | アプリ（DB） | [Step 4](./step04.md) |
-| スキップ/リトライ | `Result` 型 + チャンクループ内 | `Either` + チャンクループ内 | アプリ | [Step 5](./step05.md) |
-| リスナー/フック | 高階関数でラップ | 同左 | アプリ | [Step 5](./step05.md) |
-| 並列処理 | `Async.Parallel` | `coroutineScope` | アプリ | [Step 6](./step06.md) |
-| スケジューリング | EventBridge Scheduler | 同左 | クラウド（薄い） | [Step 7](./step07.md) |
-| ダッシュボード | Step Functions コンソール + CloudWatch | 同左 | クラウド（薄い） | [Step 7](./step07.md) / [Step 8](./step08.md) |
-| 監視・アラート | CloudWatch Logs + Metrics | 同左 | クラウド（薄い） | [Step 8](./step08.md) |
-| CSV インポート | `FlatFileItemReader` | CsvHelper / Jackson CSV | アプリ | [Step 9](./step09.md) |
+| Spring Batch 機能 | Python (SQLAlchemy + asyncio) | 実装場所 | Step |
+|---|---|---|---|
+| チャンク処理 | `async for` + `asyncio` + SQLAlchemy トランザクション | アプリ | [Step 2](./step02.md) |
+| ジョブ実行管理 | `batch_job_execution` テーブル + `run_batch` 関数 | アプリ（DB） | [Step 3](./step03.md) |
+| 二重実行防止 | DB の PK 制約 + ステータスチェック | アプリ（DB） | [Step 3](./step03.md) |
+| リスタート（オフセット再開） | `batch_chunk_progress` テーブル | アプリ（DB） | [Step 4](./step04.md) |
+| スキップ/リトライ | `try/except` + チャンクループ内カウンタ | アプリ | [Step 5](./step05.md) |
+| リスナー/フック | コールバック関数（dataclass） | アプリ | [Step 5](./step05.md) |
+| 並列処理 | `asyncio.gather` | アプリ | [Step 6](./step06.md) |
+| スケジューリング | EventBridge Scheduler | クラウド（薄い） | [Step 7](./step07.md) |
+| ダッシュボード | Step Functions コンソール + CloudWatch | クラウド（薄い） | [Step 7](./step07.md) / [Step 8](./step08.md) |
+| 監視・アラート | CloudWatch Logs + Metrics | クラウド（薄い） | [Step 8](./step08.md) |
+| CSV インポート | Python 標準 `csv` モジュール + チャンク処理 | アプリ | [Step 9](./step09.md) |
 
 ---
 
@@ -67,14 +67,14 @@ Web API の業務システム機能については [02-advanced-steps/](../02-ad
 ┌──────────────────────────────▼──────────────────────────┐
 │ アプリ層（自己完結・クラウド非依存）                         │
 │                                                         │
-│  runBatch()                                             │
-│    ├── tryStart()        → 二重実行防止（DB）             │
-│    ├── getLastProcessedId() → リスタート位置取得（DB）     │
-│    ├── processInChunks() → チャンク処理ループ             │
+│  run_batch()                                            │
+│    ├── try_start()        → 二重実行防止（DB）            │
+│    ├── get_last_processed_id() → リスタート位置取得（DB）  │
+│    ├── process_in_chunks() → チャンク処理ループ           │
 │    │     └── 各チャンク: 業務処理 + 進捗更新（同一TX）     │
-│    └── completeJob() / failJob() → ステータス更新（DB）   │
+│    └── complete_job() / fail_job() → ステータス更新（DB） │
 │                                                         │
-│  依存: DB ライブラリ（Donald / Exposed）のみ              │
+│  依存: SQLAlchemy asyncio のみ                           │
 │  外部ライブラリ追加: なし                                  │
 └──────────────────────────────┬──────────────────────────┘
                                │
@@ -99,7 +99,7 @@ Web API の業務システム機能については [02-advanced-steps/](../02-ad
 
 | ユースケース | 構成 | 備考 |
 |---|---|---|
-| 月次締め処理 | EventBridge → Step Functions → ECS Task → `runBatch` | リスタート必須。進捗テーブルで対応 |
+| 月次締め処理 | EventBridge → Step Functions → ECS Task → `run_batch` | リスタート必須。進捗テーブルで対応 |
 | 大量ロット一括状態遷移 | 同上 | 冪等設計なら進捗テーブルなしでも可 |
 | 棚卸・在庫計算 | 同上 | 並列パーティション推奨 |
 | CSV インポート | 同上 | ファイル→DB。行番号でリスタート |
@@ -111,15 +111,15 @@ Web API の業務システム機能については [02-advanced-steps/](../02-ad
 ### 自前実装の総量
 
 - テーブル: 2（`batch_job_execution` + `batch_chunk_progress`）
-- コード: 約 100〜120 行（`tryStart` + `runBatch` + `processInChunks` + `upsertProgress` + リスナー型定義）
-- 外部ライブラリ追加: なし（DB ライブラリは既存）
+- コード: 約 100〜120 行（`try_start` + `run_batch` + `process_in_chunks` + `upsert_progress` + リスナー型定義）
+- 外部ライブラリ追加: なし（SQLAlchemy asyncio は既存）
 
 ### 依存関係
 
 ```
 アプリの依存:
-  - DB ライブラリ（Donald / Exposed）← 既に使っている
-  - 2 テーブル + runBatch 関数
+  - SQLAlchemy asyncio（既に使っている）
+  - 2 テーブル + run_batch 関数
   - 外部ライブラリ追加: なし
 
 クラウドの依存（薄い・差し替え可能）:

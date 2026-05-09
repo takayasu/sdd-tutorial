@@ -34,7 +34,6 @@
 ```bash
 docker compose up -d jaeger
 
-# Jaeger UI にアクセスできることを確認
 # ブラウザで http://localhost:16686 を開く
 ```
 
@@ -47,9 +46,7 @@ docker compose up -d jaeger
 ### マイグレーション
 
 ```sql
--- 新しいマイグレーションファイルを作成（V004 は Step 2 で使用済み）
--- F#: migrations/V005__add_audit_columns.sql
--- Kotlin: src/main/resources/db/migration/V005__add_audit_columns.sql
+-- migrations/V005__add_audit_columns.sql
 
 ALTER TABLE lot ADD COLUMN created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 ALTER TABLE lot ADD COLUMN created_by TEXT NOT NULL DEFAULT 'system';
@@ -68,19 +65,47 @@ ALTER TABLE lot ADD COLUMN updated_by TEXT NOT NULL DEFAULT 'system';
 behavior 販売案件を削除する = 査定前直接販売案件 -> 削除済み OR 削除エラー
 
 -- DB上は status カラムの値で表現
-UPDATE sales_case SET status = 'cancelled', updated_by = @userId WHERE ...
+UPDATE sales_case SET status = 'cancelled', updated_by = :user_id WHERE ...
 ```
-
-本当にレコードを物理削除する必要がある場合（個人情報の削除要求等）は、物理削除 + 監査ログテーブルへの記録で対応する。
 
 ### ユーザーIDの伝播
 
 ```
 HTTPリクエスト
   → JWT認証ミドルウェア（Step 3）
-    → JWTの "sub" クレームからユーザーIDを取得
+    → JWTの "sub" クレームからユーザーIDを取得（claims["sub"]）
       → ドメインロジック実行
         → DB保存時に created_by / updated_by にユーザーIDを設定
+```
+
+### Python / FastAPI での実装
+
+```python
+# APIハンドラでユーザーIDを渡す
+@router.post("/lots")
+async def create_lot(
+    body: CreateLotInput,
+    claims: dict = Depends(require_auth),
+    session: AsyncSession = Depends(get_session),
+):
+    user_id = claims["sub"]
+    return await do_create_lot(body, user_id, session)
+```
+
+```python
+# DB保存時に監査カラムを設定
+from datetime import datetime, timezone
+
+async def do_create_lot(body: CreateLotInput, user_id: str, session: AsyncSession) -> dict:
+    now = datetime.now(timezone.utc)
+    await session.execute(
+        text(
+            "INSERT INTO lot (lot_number, status, created_at, created_by, updated_at, updated_by) "
+            "VALUES (:lot_number, 'in-production', :now, :user_id, :now, :user_id)"
+        ),
+        {"lot_number": body.lot_number, "now": now, "user_id": user_id},
+    )
+    await session.commit()
 ```
 
 ### 完了条件
@@ -88,26 +113,24 @@ HTTPリクエスト
 1. ロットを作成すると、`created_at`, `created_by` が自動的に記録されること:
 
 ```bash
-# operator ユーザーでロットを作成
 TOKEN=$(./scripts/get-token.sh test-operator)
 curl -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  http://localhost:8080/api/lots \
-  -d '{"lotNumber":{"year":2024,"location":"A","seq":99}, ...}'
+  http://localhost:8000/lots \
+  -d '{"lotNumber":{"year":2024,"location":"A","seq":99}}'
 
 # DB確認
 docker compose exec db psql -U app -d sales_management \
-  -c "SELECT lot_number_seq, created_at, created_by, updated_at, updated_by FROM lot WHERE lot_number_seq = 99;"
-# → created_by = "a1b2c3d4-..."（KeycloakのユーザーUUID）
+  -c "SELECT created_at, created_by, updated_at, updated_by FROM lot WHERE lot_number_seq = 99;"
+# → created_by = "a1b2c3d4-..."（JWTの sub クレーム）
 ```
 
 2. ロットの状態を変更すると、`updated_at`, `updated_by` が更新されること（`created_at`, `created_by` は変わらない）:
 
 ```bash
-# 別のユーザー（admin）で製造完了を指示
 ADMIN_TOKEN=$(./scripts/get-token.sh test-admin)
 curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
-  http://localhost:8080/api/lots/2024-A-099/complete-manufacturing \
+  http://localhost:8000/lots/2024-A-099/complete-manufacturing \
   -d '{"date":"2026-04-22"}'
 
 # DB確認
@@ -125,43 +148,70 @@ docker compose exec db psql -U app -d sales_management \
 
 OpenTelemetry を導入し、HTTPリクエスト・DBクエリ・外部API呼び出しのトレースを Jaeger に送信する。
 
-### F# での設定
+### Python / FastAPI での設定
 
-```fsharp
-// NuGet:
-// OpenTelemetry.Extensions.Hosting
-// OpenTelemetry.Instrumentation.AspNetCore
-// OpenTelemetry.Instrumentation.Http
-// OpenTelemetry.Exporter.OpenTelemetryProtocol
-// Npgsql.OpenTelemetry
-
-builder.Services.AddOpenTelemetry()
-    .WithTracing(fun b ->
-        b.SetResourceBuilder(ResourceBuilder.CreateDefault().AddService("sales-management"))
-         .AddAspNetCoreInstrumentation()   // HTTPリクエスト
-         .AddHttpClientInstrumentation()   // 外部API呼び出し（Step 6）
-         .AddNpgsql()                      // DBクエリ
-         .AddOtlpExporter(fun opts ->
-             opts.Endpoint <- Uri("http://localhost:4317")  // Jaeger OTLP
-         ) |> ignore
-    ) |> ignore
+```bash
+cd backend
+uv add opentelemetry-sdk \
+       opentelemetry-instrumentation-fastapi \
+       opentelemetry-instrumentation-sqlalchemy \
+       opentelemetry-instrumentation-httpx \
+       opentelemetry-exporter-otlp-proto-grpc
 ```
 
-### Kotlin での設定
+```python
+# backend/src/tracing.py
+import os
+from opentelemetry import trace
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 
-```kotlin
-// Gradle:
-// implementation("io.opentelemetry:opentelemetry-sdk")
-// implementation("io.opentelemetry:opentelemetry-exporter-otlp")
-// implementation("io.opentelemetry.instrumentation:opentelemetry-ktor-2.0")
 
-// application.conf
-ktor {
-    opentelemetry {
-        endpoint = "http://localhost:4317"
-        serviceName = "sales-management"
-    }
-}
+def configure_tracing(app) -> None:
+    resource = Resource.create({"service.name": "sales-management"})
+    provider = TracerProvider(resource=resource)
+    exporter = OTLPSpanExporter(
+        endpoint=os.environ.get("OTLP_ENDPOINT", "http://localhost:4317"),
+        insecure=True,
+    )
+    provider.add_span_processor(BatchSpanProcessor(exporter))
+    trace.set_tracer_provider(provider)
+
+    FastAPIInstrumentor.instrument_app(app)
+    SQLAlchemyInstrumentor().instrument()
+    HTTPXClientInstrumentor().instrument()
+```
+
+```python
+# src/main.py への追記
+from src.tracing import configure_tracing
+configure_tracing(app)
+```
+
+```ini
+# .env への追記
+OTLP_ENDPOINT=http://localhost:4317
+```
+
+### structlog との連携
+
+```python
+# backend/src/middleware/request_id.py に追記
+from opentelemetry import trace
+
+class RequestIdMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        span = trace.get_current_span()
+        ctx = span.get_span_context()
+        structlog.contextvars.bind_contextvars(
+            trace_id=format(ctx.trace_id, "032x") if ctx.is_valid else None
+        )
+        ...
 ```
 
 ### 完了条件
@@ -169,21 +219,17 @@ ktor {
 3. アプリを起動し、APIリクエストを送った後、Jaeger UI でトレースが表示されること:
 
 ```bash
-# APIリクエストを送る
-curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/lots/2024-A-001
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/lots/2024-A-001
 
-# ブラウザで Jaeger UI を開く
-# http://localhost:16686
-
-# 左上の「Service」ドロップダウンで「sales-management」を選択
-# 「Find Traces」をクリック
-# → トレースが表示される
+# ブラウザで http://localhost:16686 を開く
+# 「Service」ドロップダウンで「sales-management」を選択
+# 「Find Traces」をクリック → トレースが表示される
 ```
 
 4. トレースをクリックすると、以下のスパン（処理の区間）が表示されること:
 
 ```
-sales-management: GET /api/lots/2024-A-001  [15ms]
+sales-management: GET /lots/2024-A-001  [15ms]
   ├── postgresql: SELECT * FROM lot WHERE ...  [3ms]
   └── postgresql: SELECT * FROM lot_detail WHERE ...  [2ms]
 ```
@@ -191,44 +237,22 @@ sales-management: GET /api/lots/2024-A-001  [15ms]
 5. 外部API呼び出し（Step 6）を含むリクエストでは、外部APIのスパンも表示されること:
 
 ```
-sales-management: GET /api/external/price-check  [120ms]
+sales-management: GET /external/price-check  [120ms]
   ├── postgresql: SELECT * FROM lot WHERE ...  [3ms]
-  └── HTTP GET http://wiremock:8080/api/pricing/...  [100ms]
+  └── HTTP GET http://localhost:8181/api/pricing/...  [100ms]
 ```
 
-6. ログにも `traceId` が含まれていること（Step 1の構造化ログと連携）:
+6. structlog のログにも `trace_id` が含まれていること:
 
 ```
-{"traceId":"abc123def456","spanId":"789ghi","message":"GET /api/lots/2024-A-001"}
+{"level":"info","trace_id":"abc123def456...","request_id":"xyz","event":"request completed"}
 ```
 
 ### 確認のコツ
 
-- Jaeger UI の「Service」に `sales-management` が表示されない場合、OTLP Exporter の接続先（`http://localhost:4317`）が正しいか確認する
+- Jaeger UI の「Service」に `sales-management` が表示されない場合、`OTLP_ENDPOINT` の接続先が正しいか確認する
 - トレースが表示されるまで数秒かかることがある。リクエスト送信後、少し待ってから「Find Traces」をクリックする
 - Jaeger UI でトレースの各スパンをクリックすると、詳細情報（HTTPステータスコード、DBクエリ文等）が表示される
-
----
-
-## 実装ガイド
-
-### F#
-
-| 要素 | 実装方法 |
-|---|---|
-| 監査カラム自動設定 | DB層の共通関数で `created_by`, `updated_at` 等を付与 |
-| ユーザーID取得 | `HttpContext.User.FindFirst(ClaimTypes.NameIdentifier)` |
-| 分散トレーシング | `OpenTelemetry.Extensions.Hosting` + 各種 Instrumentation |
-| トレースエクスポート | OTLP Exporter → Jaeger |
-
-### Kotlin
-
-| 要素 | 実装方法 |
-|---|---|
-| 監査カラム自動設定 | Exposed の `AuditedTable` 基底クラスで共通化 |
-| ユーザーID取得 | `call.principal<JWTPrincipal>()?.payload?.subject` |
-| 分散トレーシング | OpenTelemetry Java SDK + Ktor plugin |
-| トレースエクスポート | OTLP Exporter → Jaeger |
 
 ---
 

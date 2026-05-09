@@ -14,7 +14,6 @@
 
 - 「ロットが製造完了したら倉庫システムに通知する」「契約が締結されたら請求書を生成する」といった後続処理が必要
 - 後続処理をAPIハンドラに直接書くと、ドメインロジックと通知ロジックが混ざり、変更が困難になる
-- Spring の `ApplicationEvent` + `@EventListener` に相当する仕組みを実現する
 
 ### 何がうれしいのか
 
@@ -39,68 +38,64 @@ APIリクエスト
   → レスポンス返却
 ```
 
-### F# での実装イメージ
+### Python での実装イメージ
 
-```fsharp
-// イベント型
-type DomainEvent =
-    | LotManufacturingCompleted of lotId: string * date: DateOnly
-    | ContractSigned of contractId: string
+```python
+# backend/src/events/bus.py
+from dataclasses import dataclass
+from datetime import date
+from typing import Callable
 
-// イベントバス（関数のリストを保持）
-type EventBus = {
-    mutable Handlers: (DomainEvent -> unit) list
-}
 
-let eventBus = { Handlers = [] }
+@dataclass(frozen=True)
+class LotManufacturingCompleted:
+    lot_id: str
+    date: date
 
-let subscribe (handler: DomainEvent -> unit) =
-    eventBus.Handlers <- handler :: eventBus.Handlers
 
-let publish (event: DomainEvent) =
-    eventBus.Handlers |> List.iter (fun h -> h event)
+@dataclass(frozen=True)
+class ContractSigned:
+    contract_id: str
 
-// ハンドラ登録（アプリ起動時）
-subscribe (fun event ->
-    match event with
-    | LotManufacturingCompleted (lotId, date) ->
-        printfn $"[Event] Lot {lotId} manufacturing completed on {date}"
-    | _ -> ())
 
-// APIハンドラ内で使用
-let completeManufacturingHandler lotId date =
-    let result = completeManufacturing db lotId date
-    match result with
-    | Ok lot ->
-        publish (LotManufacturingCompleted (lotId, date))
-        Ok lot
-    | Error e -> Error e
+DomainEvent = LotManufacturingCompleted | ContractSigned
+
+_handlers: list[Callable[[DomainEvent], None]] = []
+
+
+def subscribe(handler: Callable[[DomainEvent], None]) -> None:
+    _handlers.append(handler)
+
+
+def publish(event: DomainEvent) -> None:
+    for handler in _handlers:
+        handler(event)
 ```
 
-### Kotlin での実装イメージ
+```python
+# アプリ起動時にハンドラ登録（src/main.py）
+import structlog
+from src.events.bus import subscribe, LotManufacturingCompleted
 
-```kotlin
-// イベント型
-sealed interface DomainEvent {
-    data class LotManufacturingCompleted(val lotId: String, val date: LocalDate) : DomainEvent
-    data class ContractSigned(val contractId: String) : DomainEvent
-}
+logger = structlog.get_logger()
 
-// イベントバス
-object EventBus {
-    private val handlers = mutableListOf<(DomainEvent) -> Unit>()
-    fun subscribe(handler: (DomainEvent) -> Unit) { handlers.add(handler) }
-    fun publish(event: DomainEvent) { handlers.forEach { it(event) } }
-}
 
-// ハンドラ登録
-EventBus.subscribe { event ->
-    when (event) {
-        is DomainEvent.LotManufacturingCompleted ->
-            println("[Event] Lot ${event.lotId} manufacturing completed on ${event.date}")
-        else -> {}
-    }
-}
+def log_event(event: object) -> None:
+    if isinstance(event, LotManufacturingCompleted):
+        logger.info("lot manufacturing completed", lot_id=event.lot_id, date=str(event.date))
+
+
+subscribe(log_event)
+```
+
+```python
+# APIハンドラ内で使用
+from src.events.bus import publish, LotManufacturingCompleted
+
+async def complete_manufacturing(lot_id: str, body: CompleteMfgInput, ...):
+    lot = await do_complete_manufacturing(lot_id, body, session)
+    publish(LotManufacturingCompleted(lot_id=lot_id, date=body.date))
+    return lot
 ```
 
 ### フェーズ 1 の完了条件
@@ -109,12 +104,12 @@ EventBus.subscribe { event ->
 
 ```bash
 curl -X POST -H "Authorization: Bearer $TOKEN" \
-  http://localhost:8080/api/lots/2024-A-001/complete-manufacturing \
+  http://localhost:8000/lots/2024-A-001/complete-manufacturing \
   -d '{"date":"2026-04-22"}'
 # → 200 OK
 
 # ログ:
-# {"message":"[Event] Lot 2024-A-001 manufacturing completed on 2026-04-22"}
+# {"level":"info","event":"lot manufacturing completed","lot_id":"2024-A-001","date":"2026-04-22"}
 ```
 
 2. イベントハンドラが失敗しても、ドメインロジック（DB保存）は成功していること
@@ -165,22 +160,30 @@ After（フェーズ 2）:
     └── イベント保存（outbox_events テーブル）
 ```
 
-### F# での変更点
+### Python での変更点
 
-```fsharp
-// Before: 直接 publish
-publish (LotManufacturingCompleted (lotId, date))
+```python
+# Before: 直接 publish
+publish(LotManufacturingCompleted(lot_id=lot_id, date=body.date))
 
-// After: トランザクション内で outbox に INSERT
-use conn = db.OpenConnection()
-use tx = conn.BeginTransaction()
-saveLot conn updatedLot
-conn |> Db.newCommand
-    "INSERT INTO outbox_events (event_type, payload) VALUES (@type, @payload::jsonb)"
-|> Db.addParam "type" "LotManufacturingCompleted"
-|> Db.addParam "payload" (JsonSerializer.Serialize {| lotId = lotId; date = date |})
-|> Db.exec
-tx.Commit()
+# After: トランザクション内で outbox に INSERT
+import json
+from sqlalchemy import text
+
+async def complete_manufacturing(lot_id: str, body: CompleteMfgInput, session: AsyncSession):
+    async with session.begin():
+        lot = await do_complete_manufacturing(lot_id, body, session)
+        await session.execute(
+            text(
+                "INSERT INTO outbox_events (event_type, payload) "
+                "VALUES (:type, :payload::jsonb)"
+            ),
+            {
+                "type": "LotManufacturingCompleted",
+                "payload": json.dumps({"lot_id": lot_id, "date": str(body.date)}),
+            },
+        )
+    return lot
 ```
 
 ### フェーズ 2 の完了条件
@@ -189,7 +192,7 @@ tx.Commit()
 
 ```bash
 curl -X POST -H "Authorization: Bearer $TOKEN" \
-  http://localhost:8080/api/lots/2024-A-001/complete-manufacturing \
+  http://localhost:8000/lots/2024-A-001/complete-manufacturing \
   -d '{"date":"2026-04-22"}'
 
 # DB確認
@@ -218,60 +221,75 @@ docker compose exec db psql -U app -d sales_management \
   4. ハンドラが失敗した場合: status = 'failed'（手動確認用）
 ```
 
-### F# での実装イメージ
+### Python での実装イメージ
 
-```fsharp
-// IHostedService でバックグラウンドタスク
-type OutboxProcessor(db: NpgsqlDataSource) =
-    interface IHostedService with
-        member _.StartAsync(ct) =
-            Task.Run(fun () -> async {
-                while not ct.IsCancellationRequested do
-                    let events = fetchPendingEvents db 10
-                    for event in events do
-                        try
-                            processEvent event
-                            markProcessed db event.Id
-                        with ex ->
-                            markFailed db event.Id ex.Message
-                    do! Async.Sleep 5000
-            } |> Async.StartAsTask :> Task)
-        member _.StopAsync(_) = Task.CompletedTask
+```python
+# backend/src/events/outbox_processor.py
+import structlog
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+logger = structlog.get_logger()
+
+
+async def process_outbox(session: AsyncSession) -> None:
+    result = await session.execute(
+        text(
+            "SELECT id, event_type, payload FROM outbox_events "
+            "WHERE status = 'pending' ORDER BY id LIMIT 10 FOR UPDATE SKIP LOCKED"
+        )
+    )
+    rows = result.fetchall()
+    for row in rows:
+        event_id, event_type, payload = row.id, row.event_type, row.payload
+        try:
+            logger.info("processing outbox event", event_type=event_type, event_id=event_id)
+            _dispatch(event_type, payload)
+            await session.execute(
+                text(
+                    "UPDATE outbox_events SET status='processed', processed_at=NOW() "
+                    "WHERE id=:id"
+                ),
+                {"id": event_id},
+            )
+            logger.info("outbox event processed", event_id=event_id)
+        except Exception as exc:
+            logger.error("outbox event failed", event_id=event_id, error=str(exc))
+            await session.execute(
+                text("UPDATE outbox_events SET status='failed' WHERE id=:id"),
+                {"id": event_id},
+            )
+    await session.commit()
+
+
+def _dispatch(event_type: str, payload: dict) -> None:
+    if event_type == "LotManufacturingCompleted":
+        logger.info("lot manufacturing completed (async)", **payload)
 ```
 
-### Kotlin での実装イメージ
+```python
+# FastAPI lifespan でバックグラウンドタスク起動 (src/main.py)
+import asyncio
+from contextlib import asynccontextmanager
+from src.database import AsyncSessionLocal
+from src.events.outbox_processor import process_outbox
 
-```kotlin
-// CoroutineScope でバックグラウンドタスク
-fun CoroutineScope.startOutboxProcessor(db: Database) = launch {
-    while (isActive) {
-        val events = transaction(db) {
-            OutboxEvents.selectAll()
-                .where { OutboxEvents.status eq "pending" }
-                .orderBy(OutboxEvents.id)
-                .limit(10)
-                .toList()
-        }
-        for (event in events) {
-            try {
-                processEvent(event)
-                transaction(db) {
-                    OutboxEvents.update({ OutboxEvents.id eq event[OutboxEvents.id] }) {
-                        it[status] = "processed"
-                        it[processedAt] = Clock.System.now()
-                    }
-                }
-            } catch (e: Exception) {
-                transaction(db) {
-                    OutboxEvents.update({ OutboxEvents.id eq event[OutboxEvents.id] }) {
-                        it[status] = "failed"
-                    }
-                }
-            }
-        }
-        delay(5000)
-    }
-}
+
+async def _outbox_loop() -> None:
+    while True:
+        async with AsyncSessionLocal() as session:
+            await process_outbox(session)
+        await asyncio.sleep(5)
+
+
+@asynccontextmanager
+async def lifespan(app):
+    task = asyncio.create_task(_outbox_loop())
+    yield
+    task.cancel()
+
+
+app = FastAPI(lifespan=lifespan)
 ```
 
 ### フェーズ 3 の完了条件
@@ -279,27 +297,24 @@ fun CoroutineScope.startOutboxProcessor(db: Database) = launch {
 5. 製造完了APIを叩いた後、数秒待つと `outbox_events` の `status` が `processed` に変わること:
 
 ```bash
-# API実行
 curl -X POST -H "Authorization: Bearer $TOKEN" \
-  http://localhost:8080/api/lots/2024-A-001/complete-manufacturing \
+  http://localhost:8000/lots/2024-A-001/complete-manufacturing \
   -d '{"date":"2026-04-22"}'
 
 # 直後: pending
 docker compose exec db psql -U app -d sales_management \
   -c "SELECT status FROM outbox_events ORDER BY id DESC LIMIT 1;"
-# → pending
 
 # 5秒後: processed
 docker compose exec db psql -U app -d sales_management \
   -c "SELECT status, processed_at FROM outbox_events ORDER BY id DESC LIMIT 1;"
-# → processed, 2026-04-22 10:00:05
 ```
 
 6. イベントハンドラの実行ログが出力されていること:
 
 ```
-{"message":"Processing outbox event","eventType":"LotManufacturingCompleted","eventId":1}
-{"message":"Outbox event processed","eventId":1}
+{"level":"info","event":"processing outbox event","event_type":"LotManufacturingCompleted","event_id":1}
+{"level":"info","event":"outbox event processed","event_id":1}
 ```
 
 7. APIのレスポンスタイムがフェーズ 1 と変わらないこと（ポーリングはバックグラウンドなので、APIの速度に影響しない）

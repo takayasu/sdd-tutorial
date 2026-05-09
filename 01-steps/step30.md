@@ -167,10 +167,10 @@ log "all done. iterations=$ITER cost=\$$COST"
 ```text
 # progress.txt
 
-[2026-04-27 10:00:00] ralph iter=1 task='直接販売案件: 返品処理' status=ok cost=$0.82
-[2026-04-27 10:05:30] ralph iter=2 task='予約販売案件: 予約修正' status=fail reason='gradle test failed: NullPointerException at SalesCaseTest.kt:42'
-[2026-04-27 10:08:11] ralph iter=2 task='予約販売案件: 予約修正' status=ok cost=$0.95
-[2026-04-27 10:13:00] ralph iter=3 task='委託販売案件: 月次決算ジョブ' status=ok cost=$0.64
+[2026-05-08 10:00:00] ralph iter=1 task='直接販売案件: 返品処理' status=ok cost=$0.82
+[2026-05-08 10:05:30] ralph iter=2 task='予約販売案件: 予約修正' status=fail reason='uv run pytest failed: AssertionError at test_returns_pbt.py:42'
+[2026-05-08 10:08:11] ralph iter=2 task='予約販売案件: 予約修正' status=ok cost=$0.95
+[2026-05-08 10:13:00] ralph iter=3 task='委託販売案件: 月次決算ジョブ' status=ok cost=$0.64
 ```
 
 各 iter の結果を時系列で残すことで、「どこで詰まったか」「どのタスクに時間がかかったか」を後から分析できる。
@@ -256,59 +256,89 @@ mkdir -p ci-results/sarif
 
 echo "=== Jaeger 起動チェック ==="
 curl -fs http://localhost:16686/api/services > /dev/null \
-  || (echo "Jaeger 未起動" && exit 1)
+  || (echo "Jaeger 未起動: docker compose -f docker-compose.harness.yml up -d jaeger" && exit 1)
 
 echo "=== マイグレーション ==="
-echo "=== ビルド ==="
+cd backend && alembic upgrade head && cd ..
+
 echo "=== フォーマットチェック ==="
+cd backend && uv run ruff format --check src/ && cd ..
+
 echo "=== リンター ==="
+cd backend && uv run ruff check src/ && cd ..
+
+echo "=== 型チェック ==="
+cd backend && uv run mypy src/ --strict && cd ..
+cd frontend && pnpm tsc --noEmit && cd ..
+
 echo "=== テスト + カバレッジ ==="
+cd backend && uv run pytest tests/ --cov=src --cov-branch --cov-fail-under=80 -q && cd ..
+cd frontend && pnpm vitest run --coverage.enabled true && cd ..
 
 echo "=== ミューテーションテスト ==="
-(cd ../sales-management/apps/api-fsharp && dotnet stryker)
-cd kotlin && gradle pitest && cd ..
+bash scripts/check-mutmut-score.sh
+cd frontend && pnpm stryker run && cd ..
 
 echo "=== アーキテクチャ適合性 ==="
-(cd ../sales-management/apps/api-fsharp && dotnet test --filter "Category=Architecture")
-cd kotlin && gradle test --tests "*ArchitectureTest*" && cd ..
+cd backend && uv run lint-imports && cd ..
+cd frontend && pnpm depcruise src --config .dependency-cruiser.json && cd ..
 
 echo "=== コントラクトテスト (Pact) ==="
-(cd ../sales-management/apps/api-fsharp && dotnet test --filter "Category=Pact")
-cd kotlin && gradle pactVerify && cd ..
+curl -fs http://localhost:9292/diagnostic/status/heartbeat > /dev/null \
+  || (echo "Pact Broker 未起動" && exit 1)
+cd frontend && pnpm test:pact && cd ..
+cd backend && PACT_PROVIDER_STATES=true uv run pytest tests/pact/ -q && cd ..
 
 echo "=== シークレット検出 (SARIF) ==="
 gitleaks detect --source . \
   --report-format sarif --report-path ci-results/sarif/gitleaks.sarif --exit-code 1
 
 echo "=== SCA (SARIF) ==="
-trivy fs --scanners vuln --severity HIGH,CRITICAL \
-  --format sarif --output ci-results/sarif/trivy.sarif .
+cd backend
+uv run pip-audit --format json -o ../ci-results/pip_audit_raw.json || true
+python ../scripts/pip-audit-to-sarif.py ../ci-results/pip_audit_raw.json ../ci-results/sarif/pip_audit.sarif
+cd ..
 
-echo "=== SAST (SonarQube) ==="
-gradle sonar
-bash scripts/sonar-to-sarif.sh sales-management-kotlin ci-results/sarif/sonar.sarif
+echo "=== SAST (SARIF) ==="
+cd backend && uv run bandit -r src/ -ll -ii -f sarif -o ../ci-results/sarif/bandit.sarif || true && cd ..
+cd frontend && pnpm eslint src/ --format @microsoft/eslint-formatter-sarif --output-file ../ci-results/sarif/eslint.sarif || true && cd ..
 
 echo "=== DAST (OWASP ZAP, SARIF) ==="
-# (アプリ起動 → ZAP実行 → アプリ停止)
+cd backend
+uv run uvicorn src.main:app --host 0.0.0.0 --port 8000 &
+APP_PID=$!
+sleep 3
+docker run --rm --network host \
+  -v "$(pwd)/../ci-results/sarif:/zap/results" \
+  ghcr.io/zaproxy/zaproxy:stable \
+  zap-api-scan.py \
+    -t http://localhost:8000/openapi.json -f openapi \
+    -z "addonupdate;addoninstall sarifreport" -J /zap/results/zap.sarif
+kill $APP_PID
+cd ..
 
 echo "=== SBOM 生成 ==="
-cd ../sales-management/apps/api-fsharp && \
-  dotnet CycloneDX src/SalesManagement/SalesManagement.fsproj \
-    --json --output ../ci-results --filename sbom-fsharp.cdx.json && \
-  cd ..
-cd kotlin && gradle cyclonedxBom && cd ..
+cd backend && uv run cyclonedx-bom environment --of JSON --outfile ../ci-results/sbom-backend.cdx.json && cd ..
+cd frontend && pnpm cyclonedx-npm --output-format JSON --output-file ../ci-results/sbom-frontend.cdx.json && cd ..
 
 echo "=== 脆弱性パッケージを Renovate 優先化 ==="
-bash scripts/prioritize-from-trivy.sh \
-  ci-results/sarif/trivy.sarif renovate.json || true
+bash scripts/prioritize-from-sarif.sh ci-results/sarif/pip_audit.sarif renovate.json || true
 
 echo "=== 依存更新チェック (dry-run) ==="
+mkdir -p renovate-out
 RENOVATE_PLATFORM=local RENOVATE_AUTODISCOVER=false \
   npx --yes renovate --dry-run > ci-results/renovate.log 2>&1 || true
 
+echo "=== security-review ==="
+if [[ "${SECURITY_REVIEW_ENABLED:-0}" == "1" ]]; then
+  claude --skill security-review --no-interactive --output-format sarif \
+    > ci-results/sarif/security-review.sarif || true
+else
+  echo "(skip: SECURITY_REVIEW_ENABLED!=1)"
+fi
+
 echo "=== SARIF マージ ==="
-sarif merge ci-results/sarif/*.sarif \
-  --output-file-path ci-results/merged.sarif --recurse false
+cd backend && uv run python -m sarif merge ../ci-results/sarif/*.sarif -o ../ci-results/merged.sarif && cd ..
 
 echo "=== AGENTS.md 自動更新差分 ==="
 git diff --stat AGENTS.md || true
@@ -329,7 +359,7 @@ echo "=== CI完了 ==="
 全前提技術の総合：
 
 - **SARIF (Step 21)** で結果可読化
-- **Mutation (Step 22) / ArchUnit (Step 23) / Pact (Step 24)** で多層品質保証
+- **Mutation (Step 22) / アーキテクチャ適合性 (Step 23) / Pact (Step 24)** で多層品質保証
 - **SBOM (Step 25) / Renovate (Step 26)** で依存管理
 - **OTel (Step 27)** で行動観測
 - **AGENTS.md 自動更新 (Step 28)** で自己学習
@@ -357,6 +387,6 @@ Step 30 をもって本チュートリアルは終了。あとは：
 
 実運用での発展課題：
 
-- React フロントエンドを足し、Step 24 の仮 Consumer Pact を実コンシューマーテストから生成されるものへ置換
+- Step 24 の仮 Consumer Pact を、実際の API 呼び出しから生成されるものへ置換
 - Phase 3 として、エージェントが自分で PRD を生成する「Goal-Seeking RALPH」へ拡張
 - メトリクス（反復回数・コスト・失敗削減率）を Grafana ダッシュボードに統合し、ハーネスのROIを可視化

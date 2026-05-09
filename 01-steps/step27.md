@@ -46,7 +46,7 @@ $ curl -fs "http://localhost:16686/api/traces?service=claude-agent-harness&limit
 
 ## 1. Jaeger を docker-compose に追加
 
-`/docker-compose.harness.yml` に追記：
+`docker-compose.harness.yml` に追記：
 
 ```yaml
   jaeger:
@@ -146,7 +146,6 @@ import uuid
 import pathlib
 import urllib.request
 
-# stdin から フックのペイロードを取得
 try:
     payload = json.loads(sys.stdin.read() or "{}")
 except json.JSONDecodeError:
@@ -156,7 +155,6 @@ tool_name = payload.get("tool_name", "unknown")
 duration_ms = float(payload.get("duration_ms", 0))
 exit_code = int(payload.get("exit_code", 0))
 
-# トレース ID を取得（SessionStart で書いた）
 trace_file = pathlib.Path.home() / ".claude-trace-id"
 trace_id = trace_file.read_text().splitlines()[0] if trace_file.exists() else uuid.uuid4().hex
 
@@ -177,7 +175,7 @@ otlp = {
                 "traceId": trace_id,
                 "spanId": span_id,
                 "name": f"tool/{tool_name}",
-                "kind": 1,  # SPAN_KIND_INTERNAL
+                "kind": 1,
                 "startTimeUnixNano": str(start_ns),
                 "endTimeUnixNano": str(end_ns),
                 "attributes": [
@@ -185,7 +183,7 @@ otlp = {
                     {"key": "tool.exit_code", "value": {"intValue": str(exit_code)}},
                     {"key": "tool.duration_ms", "value": {"doubleValue": duration_ms}},
                 ],
-                "status": {"code": 2 if exit_code != 0 else 1}  # ERROR or OK
+                "status": {"code": 2 if exit_code != 0 else 1}
             }]
         }]
     }]
@@ -200,11 +198,10 @@ req = urllib.request.Request(
 try:
     urllib.request.urlopen(req, timeout=2)
 except Exception as e:
-    # Jaeger が落ちててもフックを失敗させない
     print(f"[OTel] failed: {e}", file=sys.stderr)
 ```
 
-`Content-Type: application/json` を付けるのが OTLP/HTTP では必須。`urllib.request` を使っているのは外部依存（`requests` 等）を増やさないため。
+`urllib.request` を使っているのは外部依存（`requests` 等）を増やさないため。
 
 ---
 
@@ -253,56 +250,73 @@ curl -fs http://localhost:16686/api/services > /dev/null \
   || (echo "Jaeger 未起動" && exit 1)
 
 echo "=== マイグレーション ==="
-echo "=== ビルド ==="
+cd backend && alembic upgrade head && cd ..
+
 echo "=== フォーマットチェック ==="
+cd backend && uv run ruff format --check src/ && cd ..
+
 echo "=== リンター ==="
+cd backend && uv run ruff check src/ && cd ..
+
+echo "=== 型チェック ==="
+cd backend && uv run mypy src/ --strict && cd ..
+cd frontend && pnpm tsc --noEmit && cd ..
+
 echo "=== テスト + カバレッジ ==="
+cd backend && uv run pytest tests/ --cov=src --cov-branch --cov-fail-under=80 -q && cd ..
+cd frontend && pnpm vitest run --coverage.enabled true && cd ..
 
 echo "=== ミューテーションテスト ==="
-(cd ../sales-management/apps/api-fsharp && dotnet stryker)
-cd kotlin && gradle pitest && cd ..
+bash scripts/check-mutmut-score.sh
+cd frontend && pnpm stryker run && cd ..
 
 echo "=== アーキテクチャ適合性 ==="
-(cd ../sales-management/apps/api-fsharp && dotnet test --filter "Category=Architecture")
-cd kotlin && gradle test --tests "*ArchitectureTest*" && cd ..
+cd backend && uv run lint-imports && cd ..
+cd frontend && pnpm depcruise src --config .dependency-cruiser.json && cd ..
 
 echo "=== コントラクトテスト (Pact) ==="
-(cd ../sales-management/apps/api-fsharp && dotnet test --filter "Category=Pact")
-cd kotlin && gradle pactVerify && cd ..
+curl -fs http://localhost:9292/diagnostic/status/heartbeat > /dev/null \
+  || (echo "Pact Broker 未起動" && exit 1)
+cd frontend && pnpm test:pact && cd ..
+cd backend && PACT_PROVIDER_STATES=true uv run pytest tests/pact/ -q && cd ..
 
 echo "=== シークレット検出 (SARIF) ==="
 gitleaks detect --source . \
   --report-format sarif --report-path ci-results/sarif/gitleaks.sarif --exit-code 1
 
 echo "=== SCA (SARIF) ==="
-trivy fs --scanners vuln --severity HIGH,CRITICAL \
-  --format sarif --output ci-results/sarif/trivy.sarif .
+cd backend
+uv run pip-audit --format json -o ../ci-results/pip_audit_raw.json || true
+python ../scripts/pip-audit-to-sarif.py ../ci-results/pip_audit_raw.json ../ci-results/sarif/pip_audit.sarif
+cd ..
 
-echo "=== SAST (SonarQube) ==="
-gradle sonar
-bash scripts/sonar-to-sarif.sh sales-management-kotlin ci-results/sarif/sonar.sarif
+echo "=== SAST (SARIF) ==="
+cd backend && uv run bandit -r src/ -ll -ii -f sarif -o ../ci-results/sarif/bandit.sarif || true && cd ..
+cd frontend && pnpm eslint src/ --format @microsoft/eslint-formatter-sarif --output-file ../ci-results/sarif/eslint.sarif || true && cd ..
 
 echo "=== DAST (OWASP ZAP, SARIF) ==="
-# (アプリ起動 → ZAP実行 → アプリ停止)
+cd backend
+uv run uvicorn src.main:app --host 0.0.0.0 --port 8000 &
+APP_PID=$!
+sleep 3
+docker run --rm --network host \
+  -v "$(pwd)/../ci-results/sarif:/zap/results" \
+  ghcr.io/zaproxy/zaproxy:stable \
+  zap-api-scan.py \
+    -t http://localhost:8000/openapi.json -f openapi \
+    -z "addonupdate;addoninstall sarifreport" -J /zap/results/zap.sarif
+kill $APP_PID
+cd ..
 
 echo "=== SBOM 生成 ==="
-cd ../sales-management/apps/api-fsharp && \
-  dotnet CycloneDX src/SalesManagement/SalesManagement.fsproj \
-    --json --output ../ci-results --filename sbom-fsharp.cdx.json && \
-  cd ..
-cd kotlin && gradle cyclonedxBom && cd ..
+cd backend && uv run cyclonedx-bom environment --of JSON --outfile ../ci-results/sbom-backend.cdx.json && cd ..
+cd frontend && pnpm cyclonedx-npm --output-format JSON --output-file ../ci-results/sbom-frontend.cdx.json && cd ..
 
 echo "=== 脆弱性パッケージを Renovate 優先化 ==="
-bash scripts/prioritize-from-trivy.sh \
-  ci-results/sarif/trivy.sarif renovate.json || true
-
-echo "=== 依存更新チェック (dry-run) ==="
-RENOVATE_PLATFORM=local RENOVATE_AUTODISCOVER=false \
-  npx --yes renovate --dry-run > ci-results/renovate.log 2>&1 || true
+bash scripts/prioritize-from-sarif.sh ci-results/sarif/pip_audit.sarif renovate.json || true
 
 echo "=== SARIF マージ ==="
-sarif merge ci-results/sarif/*.sarif \
-  --output-file-path ci-results/merged.sarif --recurse false
+cd backend && uv run python -m sarif merge ../ci-results/sarif/*.sarif -o ../ci-results/merged.sarif && cd ..
 
 echo "=== CI完了 ==="
 ```

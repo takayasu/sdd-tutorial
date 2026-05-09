@@ -35,13 +35,13 @@ EOF
 
 # 2. マスターを起動
 $ python3 .harness/master.py --prd prd.md
-[master] task decomposition: 4 subtasks
+[master] task decomposition: 1 subtasks
 [master] dispatch domain-modeler ...
-[domain-modeler] wrote types/Returns.fs
+[domain-modeler] wrote backend/src/domain/returns.py
 [master] dispatch test-writer ...
-[test-writer] wrote tests/ReturnsPbtTest.fs
+[test-writer] wrote backend/tests/test_returns_pbt.py
 [master] dispatch refactorer ...
-[refactorer] applied formatter and linter fixes
+[refactorer] applied ruff format/check and mypy fixes
 [master] dispatch doc-updater ...
 [doc-updater] updated domain-model-section2.md
 [master] all green: ./ci.sh exit 0
@@ -85,9 +85,9 @@ $ open http://localhost:16686/search?service=claude-agent-harness
 ```json
 {
   "name": "domain-modeler",
-  "description": "DSL から F#/Kotlin 型を生成する責務のみ",
+  "description": "DSL から Python frozen dataclass / TypeScript readonly interface を生成する責務のみ",
   "tools": ["Read", "Write", "Edit", "Glob", "Grep"],
-  "system_prompt": "あなたは F#/Kotlin の型定義のみを書く専門エージェントです。\n\n責務:\n- domain-model-*.md の DSL を読み、Types.fs / Types.kt を生成・更新する\n- Discriminated Union / sealed class の正しい使い分け\n- 不変性を保つ（var 禁止）\n\n禁止事項:\n- Workflows / API ハンドラ / DB アクセスへの変更\n- テストコードの記述\n\n出力: 完了時に .harness/outbox/domain-modeler/<msg_id>.json に { \"status\": \"ok\" | \"error\", \"files\": [...] } を書く"
+  "system_prompt": "あなたは Python と TypeScript の型定義のみを書く専門エージェントです。\n\n責務:\n- domain-model-*.md の DSL を読み、backend/src/domain/*.py と frontend/src/domain/*.ts を生成・更新する\n- Python: @dataclass(frozen=True) + Literal 型判別子による状態機械\n- TypeScript: readonly interface + discriminated union の正しい使い分け\n- 不変性を保つ（Python: frozen=True 必須、TypeScript: readonly 必須）\n\n禁止事項:\n- Workflows / API ハンドラ / DB アクセスへの変更\n- テストコードの記述\n\n出力: 完了時に .harness/outbox/domain-modeler/<msg_id>.json に { \"status\": \"ok\" | \"error\", \"files\": [...] } を書く"
 }
 ```
 
@@ -96,9 +96,9 @@ $ open http://localhost:16686/search?service=claude-agent-harness
 ```json
 {
   "name": "test-writer",
-  "description": "PBT・ArchUnit・Pact テストを生成する責務のみ",
+  "description": "PBT・アーキテクチャ・Pact テストを生成する責務のみ",
   "tools": ["Read", "Write", "Edit", "Glob", "Grep", "Bash"],
-  "system_prompt": "あなたはテストのみを書く専門エージェントです。\n\n責務:\n- domain-modeler が生成した型に対する FsCheck/Kotest のプロパティテストを書く\n- ArchUnit のレイヤルールを追加・更新する\n- Pact プロバイダ検証テストを更新する\n\n禁止事項:\n- 本番コード（Types.fs / Workflows.fs / Routes.fs）の変更\n- DB マイグレーション\n\n出力: 完了時に dotnet test / gradle test を実行し、結果を outbox に記録"
+  "system_prompt": "あなたはテストのみを書く専門エージェントです。\n\n責務:\n- domain-modeler が生成した型に対する hypothesis (Python PBT) / fast-check (TypeScript PBT) のプロパティテストを書く\n- import-linter のレイヤールールを追加・更新する\n- Pact プロバイダ検証テストを更新する\n\n禁止事項:\n- 本番コード（domain/*.py / workflows/*.py / routers/*.py）の変更\n- DB マイグレーション\n\n出力: 完了時に uv run pytest / pnpm vitest run を実行し、結果を outbox に記録"
 }
 ```
 
@@ -109,7 +109,7 @@ $ open http://localhost:16686/search?service=claude-agent-harness
   "name": "refactorer",
   "description": "Linter / Formatter / SAST の指摘を受けて refactor する責務のみ",
   "tools": ["Read", "Edit", "Bash"],
-  "system_prompt": "あなたは Lint/Format/SAST の指摘を解消する専門エージェントです。\n\n責務:\n- ci-results/merged.sarif を読み、warning/error を順に解消\n- ロジック変更は最小限（型を変えてはいけない）\n- Fantomas / FSharpLint / detekt の警告 0 を目標\n\n禁止事項:\n- 新機能追加\n- 型定義の変更\n- テストの書き換え（テストが落ちたら test-writer に戻す）"
+  "system_prompt": "あなたは Lint/Format/SAST の指摘を解消する専門エージェントです。\n\n責務:\n- ci-results/merged.sarif を読み、warning/error を順に解消\n- ロジック変更は最小限（型を変えてはいけない）\n- ruff format / ruff check / mypy --strict / eslint の警告 0 を目標\n\n禁止事項:\n- 新機能追加\n- 型定義の変更\n- テストの書き換え（テストが落ちたら test-writer に戻す）"
 }
 ```
 
@@ -120,7 +120,7 @@ $ open http://localhost:16686/search?service=claude-agent-harness
   "name": "doc-updater",
   "description": "domain-model-*.md / README.md / AGENTS.md を整合させる責務のみ",
   "tools": ["Read", "Write", "Edit"],
-  "system_prompt": "あなたはドキュメント整合エージェントです。\n\n責務:\n- 実装変更後、domain-model-section*.md を最新化\n- README.md の API 一覧を更新\n- AGENTS.md の自動生成セクションには触らない（Stop フックの管轄）\n\n禁止事項:\n- コードの変更\n- AGENTS.md の自動生成セクションの編集"
+  "system_prompt": "あなたはドキュメント整合エージェントです。\n\n責務:\n- 実装変更後、domain-model-section*.md を最新化\n- README.md の API 一覧を更新（FastAPI の /openapi.json を参照）\n- AGENTS.md の自動生成セクションには触らない（Stop フックの管轄）\n\n禁止事項:\n- コードの変更\n- AGENTS.md の自動生成セクションの編集"
 }
 ```
 
@@ -243,12 +243,13 @@ if __name__ == "__main__":
 
 ## domain-modeler
 
-- 2026-04-27 NonEmptyList を使う際は `Arrow.core` を import すること
-- 2026-04-27 F# の DU は IL では sealed class なので ArchUnit の sealed ルールに合致
+- 2026-05-08 Python frozen dataclass の field() でデフォルト値が必要な場合は field(default=...) を使う
+- 2026-05-08 Literal 型は `from typing import Literal` でインポートが必要（Python 3.8+）
 
 ## test-writer
 
-- 2026-04-27 PBT のジェネレータは domain 型ごとに 1 つ用意すると保守しやすい
+- 2026-05-08 hypothesis の @given で frozen dataclass を生成するには st.builds() を使う
+- 2026-05-08 fast-check で readonly な TypeScript 型を生成するときは fc.record() が便利
 ```
 
 ---
@@ -260,13 +261,13 @@ if __name__ == "__main__":
 ```
 master (root span)
 ├── tool/dispatch domain-modeler
-│   ├── tool/Read (Types.fs)
-│   ├── tool/Edit (Types.fs)
+│   ├── tool/Read (backend/src/domain/returns.py)
+│   ├── tool/Edit (backend/src/domain/returns.py)
 │   └── tool/Write (.harness/outbox/domain-modeler/xxx.json)
 ├── tool/dispatch test-writer
 │   ├── tool/Read
-│   ├── tool/Write (LotPropertyTest.kt)
-│   └── tool/Bash (gradle test)
+│   ├── tool/Write (backend/tests/test_returns_pbt.py)
+│   └── tool/Bash (uv run pytest)
 ├── tool/dispatch refactorer
 └── tool/dispatch doc-updater
 ```
@@ -284,6 +285,105 @@ ci.sh 自体は変更しない。マスターが内部から `./ci.sh` を呼ぶ
 ## ci.sh の現時点の構成
 
 （Step 28 と同じ。マスターは ci.sh を変更しない）
+
+```bash
+#!/bin/bash
+set -e
+
+echo "=== ci-results/ 初期化 ==="
+mkdir -p ci-results/sarif
+
+echo "=== Jaeger 起動チェック ==="
+curl -fs http://localhost:16686/api/services > /dev/null \
+  || (echo "Jaeger 未起動: docker compose -f docker-compose.harness.yml up -d jaeger" && exit 1)
+
+echo "=== マイグレーション ==="
+cd backend && alembic upgrade head && cd ..
+
+echo "=== フォーマットチェック ==="
+cd backend && uv run ruff format --check src/ && cd ..
+
+echo "=== リンター ==="
+cd backend && uv run ruff check src/ && cd ..
+
+echo "=== 型チェック ==="
+cd backend && uv run mypy src/ --strict && cd ..
+cd frontend && pnpm tsc --noEmit && cd ..
+
+echo "=== テスト + カバレッジ ==="
+cd backend && uv run pytest tests/ --cov=src --cov-branch --cov-fail-under=80 -q && cd ..
+cd frontend && pnpm vitest run --coverage.enabled true && cd ..
+
+echo "=== ミューテーションテスト ==="
+bash scripts/check-mutmut-score.sh
+cd frontend && pnpm stryker run && cd ..
+
+echo "=== アーキテクチャ適合性 ==="
+cd backend && uv run lint-imports && cd ..
+cd frontend && pnpm depcruise src --config .dependency-cruiser.json && cd ..
+
+echo "=== コントラクトテスト (Pact) ==="
+curl -fs http://localhost:9292/diagnostic/status/heartbeat > /dev/null \
+  || (echo "Pact Broker 未起動" && exit 1)
+cd frontend && pnpm test:pact && cd ..
+cd backend && PACT_PROVIDER_STATES=true uv run pytest tests/pact/ -q && cd ..
+
+echo "=== シークレット検出 (SARIF) ==="
+gitleaks detect --source . \
+  --report-format sarif --report-path ci-results/sarif/gitleaks.sarif --exit-code 1
+
+echo "=== SCA (SARIF) ==="
+cd backend
+uv run pip-audit --format json -o ../ci-results/pip_audit_raw.json || true
+python ../scripts/pip-audit-to-sarif.py ../ci-results/pip_audit_raw.json ../ci-results/sarif/pip_audit.sarif
+cd ..
+
+echo "=== SAST (SARIF) ==="
+cd backend && uv run bandit -r src/ -ll -ii -f sarif -o ../ci-results/sarif/bandit.sarif || true && cd ..
+cd frontend && pnpm eslint src/ --format @microsoft/eslint-formatter-sarif --output-file ../ci-results/sarif/eslint.sarif || true && cd ..
+
+echo "=== DAST (OWASP ZAP, SARIF) ==="
+cd backend
+uv run uvicorn src.main:app --host 0.0.0.0 --port 8000 &
+APP_PID=$!
+sleep 3
+docker run --rm --network host \
+  -v "$(pwd)/../ci-results/sarif:/zap/results" \
+  ghcr.io/zaproxy/zaproxy:stable \
+  zap-api-scan.py \
+    -t http://localhost:8000/openapi.json -f openapi \
+    -z "addonupdate;addoninstall sarifreport" -J /zap/results/zap.sarif
+kill $APP_PID
+cd ..
+
+echo "=== SBOM 生成 ==="
+cd backend && uv run cyclonedx-bom environment --of JSON --outfile ../ci-results/sbom-backend.cdx.json && cd ..
+cd frontend && pnpm cyclonedx-npm --output-format JSON --output-file ../ci-results/sbom-frontend.cdx.json && cd ..
+
+echo "=== 脆弱性パッケージを Renovate 優先化 ==="
+bash scripts/prioritize-from-sarif.sh ci-results/sarif/pip_audit.sarif renovate.json || true
+
+echo "=== 依存更新チェック (dry-run) ==="
+mkdir -p renovate-out
+RENOVATE_PLATFORM=local RENOVATE_AUTODISCOVER=false \
+  npx --yes renovate --dry-run > ci-results/renovate.log 2>&1 || true
+
+echo "=== security-review ==="
+if [[ "${SECURITY_REVIEW_ENABLED:-0}" == "1" ]]; then
+  claude --skill security-review --no-interactive --output-format sarif \
+    > ci-results/sarif/security-review.sarif || true
+else
+  echo "(skip: SECURITY_REVIEW_ENABLED!=1)"
+fi
+
+echo "=== SARIF マージ ==="
+cd backend && uv run python -m sarif merge ../ci-results/sarif/*.sarif -o ../ci-results/merged.sarif && cd ..
+
+echo "=== AGENTS.md 自動更新差分 ==="
+git diff --stat AGENTS.md || true
+
+echo "=== CI完了 ==="
+```
 
 ---
 

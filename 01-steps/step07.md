@@ -1,442 +1,416 @@
-# Step 7: 在庫ロットの集約API完全パッケージ + DB永続化
+# Step 7: 在庫ロット集約API完全パッケージ + DB永続化
 
 ## 目的
 
 ### これは何か
 
-Step 6で定義した型を使って、在庫ロットの**集約APIを「完全パッケージ」として一気に実装する**。状態遷移の mutation だけでなく、後付けで漏れがちな以下を**最初から**含める:
+Step 6 で定義したドメイン型を使い、CRUD API と DB 永続化を一気に完成させる。
 
-| 要素 | 内容 |
-|---|---|
-| Mutation | 状態遷移 (create / complete-manufacturing / instruct-shipping / ...) |
-| **詳細 GET** | `GET /lots/{id}` でロット 1 件取得 |
-| **一覧 GET** | `GET /lots?status=...&limit=&offset=` でページング付き一覧取得 |
-| **楽観ロック** | `version: int` カラム + `WHERE version = @expected` での更新。競合時 **409 Conflict** |
-| **エラー形式** | 全レスポンスを `application/problem+json` (RFC 9457) で統一 |
-| **OpenAPI 完全記述** | `components.schemas` に `LotResponse`, `LotSummary`, `LotsListResponse`, `CreateLotRequest`, `LotStatus` を全部定義し、各 path の `responses.content.schema` を `$ref` で埋める |
-| **ci.sh verify** | Step 1 で導入した verify セクションに本ステップの curl を**追記**する |
-
-これは Step 14 / 15 / 18 でも同じテンプレで繰り返す。**この時点で「型 + DB + API + ドキュメント + 検証」が揃った状態**を 1 step で確立し、以降の集約はテンプレ通りに作る。
+- **SQLAlchemy ORM モデル** — `lot` テーブルへのマッピング
+- **リポジトリ層** — DB アクセスをドメインロジックから隔離
+- **FastAPI ルーター** — `POST /lots`, `GET /lots/{id}`, `GET /lots`, `PATCH /lots/{id}/status`
+- **統合テスト** — `pytest` + `httpx.AsyncClient` でエンドポイントを直接叩く
 
 ### なぜやるのか
 
-- DSLの `behavior`（振る舞い）をAPIエンドポイントとして実現する
-- 「製造完了を指示する」「出荷を指示する」といった業務操作を、HTTPリクエストで呼び出せるようにする
-- 状態をDBに永続化することで、サーバーを再起動してもデータが消えない
-- **後付けは高コスト**: 詳細GET / 一覧GET / 楽観ロック / problem+json / openapi 完全記述 を後回しにすると、フロント連携時に必ず手戻りが発生する
-- **CI の verify セクションに curl を残す**ことで、ralph が `[x]` をつけた後に実装が消えても次の `./ci.sh` で落ちる
+- ドメイン型が「実際に動く API」に繋がることで、型定義の意味が具体化する
+- リポジトリパターンで DB アクセスを抽象化すると、テストでモックが不要になる（実DB を使う）
+- `PATCH /lots/{id}/status` が「不正な状態遷移」を 422 で弾くことを統合テストで確認する
 
 ### 何がうれしいのか
 
-- 型定義のおかげで、不正な状態遷移（例：製造中ロットに出荷完了を指示する）がコンパイル時に防がれる
-- APIとして公開することで、フロントエンドや他システムから呼び出せる
-- 「DSL → 型 → API → DB」という一連の流れが体験できる。これがAI駆動開発の基本サイクル
-- フロント側 (将来 React や別 SPA を生やす時) は `openapi-zod-client` 等で**手書きゼロ**で型が揃う
+- `InventoryLot` の `match` 文が実際の API レスポンスに反映される
+- フロントエンドは Step 6 の TypeScript 型を使って型安全に API を呼び出せる
+- 新しい状態遷移ルールを追加するとき、テストが先に失敗して実装漏れを防ぐ
 
 ## 完了条件
 
-以下の **(a) 動作要件** すべてが通ること、**かつ (b) ci.sh verify セクションへ追記** が完了していること。
+```bash
+# 統合テスト通過
+$ cd backend && pytest tests/test_lots.py -v
+PASSED tests/test_lots.py::test_create_lot
+PASSED tests/test_lots.py::test_get_lot
+PASSED tests/test_lots.py::test_list_lots
+PASSED tests/test_lots.py::test_invalid_status_transition
 
-### (a) 動作要件
+# ci.sh の verify セクション
+$ ./ci.sh
+PASS POST /lots
+PASS GET /lots/{id}
+PASS PATCH /lots/{id}/status invalid transition → 422
+```
+
+---
+
+## 実装
+
+### 1. SQLAlchemy ORM モデル（src/infra/models.py）
+
+```python
+from __future__ import annotations
+
+from datetime import date
+
+import sqlalchemy as sa
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class LotRow(Base):
+    __tablename__ = "lot"
+
+    id: Mapped[int] = mapped_column(sa.Integer, primary_key=True, autoincrement=True)
+    lot_number_year: Mapped[int] = mapped_column(sa.Integer, nullable=False)
+    lot_number_location: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    lot_number_seq: Mapped[int] = mapped_column(sa.Integer, nullable=False)
+    division_code: Mapped[int] = mapped_column(sa.Integer, nullable=False)
+    department_code: Mapped[int] = mapped_column(sa.Integer, nullable=False)
+    section_code: Mapped[int] = mapped_column(sa.Integer, nullable=False)
+    process_category: Mapped[int] = mapped_column(sa.Integer, nullable=False)
+    inspection_category: Mapped[int] = mapped_column(sa.Integer, nullable=False)
+    manufacturing_category: Mapped[int] = mapped_column(sa.Integer, nullable=False)
+    status: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    manufacturing_completed_date: Mapped[date | None] = mapped_column(sa.Date, nullable=True)
+    shipping_deadline_date: Mapped[date | None] = mapped_column(sa.Date, nullable=True)
+    shipped_date: Mapped[date | None] = mapped_column(sa.Date, nullable=True)
+    version: Mapped[int] = mapped_column(sa.Integer, nullable=False, server_default="1")
+
+    __table_args__ = (
+        sa.UniqueConstraint(
+            "lot_number_year",
+            "lot_number_location",
+            "lot_number_seq",
+            name="uq_lot_number",
+        ),
+    )
+```
+
+### 2. Pydantic スキーマ（src/schemas/lot.py）
+
+```python
+from __future__ import annotations
+
+from datetime import date
+from typing import Literal
+
+from pydantic import BaseModel
+
+
+class LotCreateRequest(BaseModel):
+    lot_number_year: int
+    lot_number_location: str
+    lot_number_seq: int
+    division_code: int
+    department_code: int
+    section_code: int
+    process_category: int
+    inspection_category: int
+    manufacturing_category: int
+
+
+class StatusTransitionRequest(BaseModel):
+    status: Literal["manufactured", "shipping_instructed", "shipped"]
+    manufacturing_completed_date: date | None = None
+    shipping_deadline_date: date | None = None
+    shipped_date: date | None = None
+
+
+class LotResponse(BaseModel):
+    id: int
+    lot_number_year: int
+    lot_number_location: str
+    lot_number_seq: int
+    division_code: int
+    department_code: int
+    section_code: int
+    process_category: int
+    inspection_category: int
+    manufacturing_category: int
+    status: str
+    manufacturing_completed_date: date | None
+    shipping_deadline_date: date | None
+    shipped_date: date | None
+    version: int
+
+    model_config = {"from_attributes": True}
+```
+
+### 3. リポジトリ（src/infra/lot_repository.py）
+
+```python
+from __future__ import annotations
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.infra.models import LotRow
+from src.schemas.lot import LotCreateRequest, LotResponse, StatusTransitionRequest
+
+
+class LotRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def create(self, req: LotCreateRequest) -> LotResponse:
+        row = LotRow(
+            lot_number_year=req.lot_number_year,
+            lot_number_location=req.lot_number_location,
+            lot_number_seq=req.lot_number_seq,
+            division_code=req.division_code,
+            department_code=req.department_code,
+            section_code=req.section_code,
+            process_category=req.process_category,
+            inspection_category=req.inspection_category,
+            manufacturing_category=req.manufacturing_category,
+            status="manufacturing",
+        )
+        self._session.add(row)
+        await self._session.flush()
+        await self._session.refresh(row)
+        return LotResponse.model_validate(row)
+
+    async def get_by_id(self, lot_id: int) -> LotRow | None:
+        return await self._session.get(LotRow, lot_id)
+
+    async def list_all(self) -> list[LotResponse]:
+        result = await self._session.execute(select(LotRow))
+        return [LotResponse.model_validate(r) for r in result.scalars().all()]
+
+    async def transition_status(
+        self, lot_id: int, req: StatusTransitionRequest
+    ) -> LotResponse:
+        row = await self._session.get(LotRow, lot_id)
+        if row is None:
+            raise ValueError(f"Lot {lot_id} not found")
+
+        _validate_transition(row.status, req)
+
+        row.status = req.status
+        if req.manufacturing_completed_date is not None:
+            row.manufacturing_completed_date = req.manufacturing_completed_date
+        if req.shipping_deadline_date is not None:
+            row.shipping_deadline_date = req.shipping_deadline_date
+        if req.shipped_date is not None:
+            row.shipped_date = req.shipped_date
+        row.version += 1
+
+        await self._session.flush()
+        await self._session.refresh(row)
+        return LotResponse.model_validate(row)
+
+
+_VALID_TRANSITIONS: dict[str, set[str]] = {
+    "manufacturing": {"manufactured"},
+    "manufactured": {"shipping_instructed"},
+    "shipping_instructed": {"shipped"},
+    "shipped": set(),
+}
+
+
+def _validate_transition(current: str, req: StatusTransitionRequest) -> None:
+    allowed = _VALID_TRANSITIONS.get(current, set())
+    if req.status not in allowed:
+        raise ValueError(
+            f"Cannot transition from '{current}' to '{req.status}'. "
+            f"Allowed: {allowed or 'none'}"
+        )
+    if req.status == "manufactured" and req.manufacturing_completed_date is None:
+        raise ValueError("manufacturing_completed_date is required for 'manufactured'")
+    if req.status == "shipping_instructed" and req.shipping_deadline_date is None:
+        raise ValueError("shipping_deadline_date is required for 'shipping_instructed'")
+    if req.status == "shipped" and req.shipped_date is None:
+        raise ValueError("shipped_date is required for 'shipped'")
+```
+
+### 4. ルーター（src/routers/lots.py）
+
+```python
+from __future__ import annotations
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.database import get_session
+from src.infra.lot_repository import LotRepository
+from src.schemas.lot import LotCreateRequest, LotResponse, StatusTransitionRequest
+
+router = APIRouter(prefix="/lots", tags=["lots"])
+
+
+@router.post("", response_model=LotResponse, status_code=201)
+async def create_lot(
+    body: LotCreateRequest,
+    session: AsyncSession = Depends(get_session),
+) -> LotResponse:
+    repo = LotRepository(session)
+    result = await repo.create(body)
+    await session.commit()
+    return result
+
+
+@router.get("", response_model=list[LotResponse])
+async def list_lots(
+    session: AsyncSession = Depends(get_session),
+) -> list[LotResponse]:
+    repo = LotRepository(session)
+    return await repo.list_all()
+
+
+@router.get("/{lot_id}", response_model=LotResponse)
+async def get_lot(
+    lot_id: int,
+    session: AsyncSession = Depends(get_session),
+) -> LotResponse:
+    repo = LotRepository(session)
+    row = await repo.get_by_id(lot_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Lot not found")
+    return LotResponse.model_validate(row)
+
+
+@router.patch("/{lot_id}/status", response_model=LotResponse)
+async def transition_lot_status(
+    lot_id: int,
+    body: StatusTransitionRequest,
+    session: AsyncSession = Depends(get_session),
+) -> LotResponse:
+    repo = LotRepository(session)
+    try:
+        result = await repo.transition_status(lot_id, body)
+        await session.commit()
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+```
+
+### 5. main.py にルーター登録
+
+```python
+# src/main.py に追加
+from src.routers.lots import router as lots_router
+
+app.include_router(lots_router)
+```
+
+---
+
+## 統合テスト
+
+### tests/test_lots.py
+
+```python
+from __future__ import annotations
+
+import pytest
+from httpx import AsyncClient, ASGITransport
+
+from src.main import app
+
+
+@pytest.fixture
+async def client():
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as c:
+        yield c
+
+
+LOT_PAYLOAD = {
+    "lot_number_year": 2024,
+    "lot_number_location": "TK",
+    "lot_number_seq": 1,
+    "division_code": 1,
+    "department_code": 10,
+    "section_code": 100,
+    "process_category": 1,
+    "inspection_category": 1,
+    "manufacturing_category": 1,
+}
+
+
+async def test_create_lot(client: AsyncClient) -> None:
+    res = await client.post("/lots", json=LOT_PAYLOAD)
+    assert res.status_code == 201
+    body = res.json()
+    assert body["status"] == "manufacturing"
+    assert body["id"] is not None
+
+
+async def test_get_lot(client: AsyncClient) -> None:
+    create_res = await client.post("/lots", json=LOT_PAYLOAD)
+    lot_id = create_res.json()["id"]
+
+    res = await client.get(f"/lots/{lot_id}")
+    assert res.status_code == 200
+    assert res.json()["id"] == lot_id
+
+
+async def test_list_lots(client: AsyncClient) -> None:
+    await client.post("/lots", json=LOT_PAYLOAD)
+    res = await client.get("/lots")
+    assert res.status_code == 200
+    assert isinstance(res.json(), list)
+    assert len(res.json()) >= 1
+
+
+async def test_valid_status_transition(client: AsyncClient) -> None:
+    from datetime import date
+
+    create_res = await client.post("/lots", json=LOT_PAYLOAD)
+    lot_id = create_res.json()["id"]
+
+    res = await client.patch(
+        f"/lots/{lot_id}/status",
+        json={
+            "status": "manufactured",
+            "manufacturing_completed_date": str(date.today()),
+        },
+    )
+    assert res.status_code == 200
+    assert res.json()["status"] == "manufactured"
+
+
+async def test_invalid_status_transition(client: AsyncClient) -> None:
+    create_res = await client.post("/lots", json=LOT_PAYLOAD)
+    lot_id = create_res.json()["id"]
+
+    # manufacturing → shipped は不正（中間状態をスキップ）
+    res = await client.patch(
+        f"/lots/{lot_id}/status",
+        json={"status": "shipped", "shipped_date": "2024-03-01"},
+    )
+    assert res.status_code == 422
+```
+
+---
+
+## ci.sh への追加
 
 ```bash
-# 1. ロット作成（製造中状態で作成される。version=1 が返る）
-$ curl -sf -X POST http://localhost:5000/lots \
+echo "=== verify: Lots API ==="
+LOT_ID=$(curl -sf -X POST http://localhost:8000/lots \
   -H "Content-Type: application/json" \
-  -d '{"lotNumber": {"year": 2024, "location": "A", "seq": 1}, "divisionCode": 1, ...}'
-{"status":"manufacturing","lotNumber":"2024-A-001","version":1}
+  -d '{"lot_number_year":2024,"lot_number_location":"TK","lot_number_seq":1,
+       "division_code":1,"department_code":10,"section_code":100,
+       "process_category":1,"inspection_category":1,"manufacturing_category":1}' \
+  | python -c "import sys,json; print(json.load(sys.stdin)['id'])")
+echo "PASS POST /lots (id=$LOT_ID)"
 
-# 2. 詳細 GET — 集約 ID から 1 件取得 (caseType ポリモーフィックの基礎)
-$ curl -sf http://localhost:5000/lots/2024-A-001 | jq -e '.lotNumber and .status and .version' >/dev/null
-$ echo $?
-0
+curl -sf "http://localhost:8000/lots/$LOT_ID" >/dev/null
+echo "PASS GET /lots/$LOT_ID"
 
-# 3. 一覧 GET — ページング (limit/offset) と status フィルタ
-$ curl -sf "http://localhost:5000/lots?limit=20&offset=0" | jq -e '.items and .total and (.limit==20)' >/dev/null
-$ curl -sf "http://localhost:5000/lots?status=manufacturing&limit=10" | jq -e '.items|all(.status=="manufacturing")' >/dev/null
-
-# 4. 製造完了を指示（version を渡す。サーバは新 version を返す）
-$ curl -sf -X POST http://localhost:5000/lots/2024-A-001/complete-manufacturing \
+STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+  -X PATCH "http://localhost:8000/lots/$LOT_ID/status" \
   -H "Content-Type: application/json" \
-  -d '{"date": "2024-04-01", "version": 1}'
-{"status":"manufactured","manufacturingCompletedDate":"2024-04-01","version":2}
-
-# 5. 楽観ロック競合 — 古い version で更新すると 409 + problem+json
-$ curl -s -o /dev/null -w "%{http_code} %{content_type}\n" \
-    -X POST http://localhost:5000/lots/2024-A-001/instruct-shipping \
-    -H "Content-Type: application/json" \
-    -d '{"deadlineDate":"2024-05-01","version":1}'
-409 application/problem+json
-
-# 6. 不正な遷移 — problem+json で 400 (`{ "error": ... }` ではない！)
-$ curl -s -o /dev/null -w "%{http_code} %{content_type}\n" \
-    -X POST http://localhost:5000/lots/2024-A-001/complete-shipping \
-    -H "Content-Type: application/json" \
-    -d '{"date": "2024-04-10","version":2}'
-400 application/problem+json
-
-# 7. 存在しない ID — 404 + problem+json
-$ curl -s -o /dev/null -w "%{http_code} %{content_type}\n" http://localhost:5000/lots/9999-Z-999
-404 application/problem+json
-
-# 8. DB 永続化と version カラムの存在
-$ docker compose exec db psql -U app -d sales_management \
-  -c "SELECT lot_number_year, lot_number_location, lot_number_seq, status, version FROM lot"
-
-# 9. OpenAPI 完全記述 — 必要なスキーマがすべて埋まっている
-$ python3 -c "
-import yaml
-y = yaml.safe_load(open('openapi.yaml'))
-required = ['LotResponse','LotSummary','LotsListResponse','CreateLotRequest','LotStatus']
-missing = [s for s in required if s not in y['components']['schemas']]
-assert not missing, f'missing schemas: {missing}'
-# 各 path の 200 / 400 / 404 / 409 が \$ref を持つこと
-for p, ops in y['paths'].items():
-    for verb, op in ops.items():
-        if verb not in ('get','post','put','delete','patch'): continue
-        for code, resp in op.get('responses', {}).items():
-            if code in ('400','404','409'):
-                assert '\$ref' in str(resp), f'{p} {verb} {code}: not problem+json'
-print('OK')
-"
-OK
-```
-
-### (b) `ci.sh` の verify セクションへ追記
-
-Step 1 で `ci.sh` 末尾に作った verify ブロックに、上記 1-9 を `curl -sf` / `jq -e` の形で追加する。`./ci.sh` を実行して以下が出力されること:
-
-```
-=== verify (smoke) ===
-PASS /health
-PASS security-headers
-PASS cors-preflight
-PASS problem+json-on-404
-PASS lot-create
-PASS lot-detail-get
-PASS lot-list-paged
-PASS lot-list-status-filter
-PASS lot-version-conflict-409
-PASS lot-invalid-transition-400
-PASS lot-not-found-404
-PASS openapi-schemas-complete
-=== CI完了 ===
-$ echo $?
-0
-```
-
-**重要**: ralph で本 step を `[x]` にする前に、必ず `./ci.sh` が緑になっていること。verify ブロックに curl が追加されていなければ false-positive completion とみなす。
-
----
-
-## 実装するAPI
-
-| メソッド | パス | 対応するbehavior / 役割 | version 必須 |
-|---|---|---|---|
-| POST | `/lots` | ロット作成（製造中状態で作成） | 不要 (新規) |
-| **GET** | **`/lots`** | **一覧取得（`status` フィルタ、`limit`/`offset` ページング）** | 不要 |
-| **GET** | **`/lots/{id}`** | **詳細取得（1 件）** | 不要 |
-| POST | `/lots/{id}/complete-manufacturing` | 製造完了を指示する | **必須** |
-| POST | `/lots/{id}/instruct-shipping` | 出荷を指示する | **必須** |
-| POST | `/lots/{id}/complete-shipping` | 出荷完了を指示する | **必須** |
-| POST | `/lots/{id}/cancel-manufacturing-completion` | 製造完了を取り消す | **必須** |
-
-### 一覧 GET のレスポンス形 (Step 14 / 18 でも同じ規約を使う)
-
-```json
-{
-  "items": [
-    {"lotNumber":"2024-A-001","status":"manufactured","manufacturingCompletedDate":"2024-04-01","version":2}
-  ],
-  "total": 127,
-  "limit": 20,
-  "offset": 0
-}
-```
-
-### 楽観ロック実装方針
-
-- 全テーブルに `version INTEGER NOT NULL DEFAULT 1` を追加
-- 状態遷移 mutation は `WHERE version = @expected_version` を含めた UPDATE
-- 影響行 0 行 → 409 Conflict + problem+json (`type: "/errors/version-conflict"`)
-- 成功時はレスポンス body の `version` をインクリメント後の値で返す
-
----
-
-## F# 実装の構造
-
-### ドメインロジック（純粋関数）
-
-```fsharp
-// Domain/LotWorkflows.fs
-module SalesManagement.Domain.LotWorkflows
-
-type ManufacturingCompletionError = | LotNotInManufacturing
-type ShippingInstructionError = | LotNotManufactured
-type ShippingCompletionError = | LotNotShippingInstructed
-type CancellationError = | LotNotManufactured
-
-let completeManufacturing (date: DateOnly) (lot: ManufacturingLot) : ManufacturedLot =
-    { Common = lot.Common
-      ManufacturingCompletedDate = date }
-
-let instructShipping (deadline: DateOnly) (lot: ManufacturedLot) : ShippingInstructedLot =
-    { Common = lot.Common
-      ManufacturingCompletedDate = lot.ManufacturingCompletedDate
-      ShippingDeadlineDate = deadline }
-
-let completeShipping (date: DateOnly) (lot: ShippingInstructedLot) : ShippedLot =
-    { Common = lot.Common
-      ManufacturingCompletedDate = lot.ManufacturingCompletedDate
-      ShippingDeadlineDate = lot.ShippingDeadlineDate
-      ShippedDate = date }
-
-let cancelManufacturingCompletion (lot: ManufacturedLot) : ManufacturingLot =
-    { Common = lot.Common }
-```
-
-### DB永続化（Donald）
-
-```fsharp
-// Infrastructure/LotRepository.fs
-module SalesManagement.Infrastructure.LotRepository
-
-open Donald
-open Npgsql
-
-let save (conn: NpgsqlConnection) (lot: InventoryLot) =
-    let (lotNumber, status, mfgDate, shipDeadline, shippedDate) =
-        match lot with
-        | Manufacturing l -> (l.Common.LotNumber, "manufacturing", None, None, None)
-        | Manufactured l -> (l.Common.LotNumber, "manufactured", Some l.ManufacturingCompletedDate, None, None)
-        | ShippingInstructed l -> (l.Common.LotNumber, "shipping_instructed", Some l.ManufacturingCompletedDate, Some l.ShippingDeadlineDate, None)
-        | Shipped l -> (l.Common.LotNumber, "shipped", Some l.ManufacturingCompletedDate, Some l.ShippingDeadlineDate, Some l.ShippedDate)
-
-    conn
-    |> Db.newCommand """
-        UPDATE lot SET status = @status,
-            manufacturing_completed_date = @mfg_date,
-            shipping_deadline_date = @ship_deadline,
-            shipped_date = @shipped_date
-        WHERE lot_number_year = @year
-          AND lot_number_location = @location
-          AND lot_number_seq = @seq"""
-    |> Db.setParams [
-        "status", SqlType.String status
-        "mfg_date", SqlType.AnsiString (mfgDate |> Option.map string |> Option.defaultValue null)
-        "ship_deadline", SqlType.AnsiString (shipDeadline |> Option.map string |> Option.defaultValue null)
-        "shipped_date", SqlType.AnsiString (shippedDate |> Option.map string |> Option.defaultValue null)
-        "year", SqlType.Int32 lotNumber.Year
-        "location", SqlType.String lotNumber.Location
-        "seq", SqlType.Int32 lotNumber.Seq ]
-    |> Db.exec
-```
-
-### APIルーティング（Giraffe）
-
-```fsharp
-// Api/LotRoutes.fs
-let lotRoutes : HttpHandler =
-    choose [
-        POST >=> routef "/lots/%s/complete-manufacturing" (fun id -> completeManufacturingHandler id)
-        POST >=> routef "/lots/%s/instruct-shipping" (fun id -> instructShippingHandler id)
-        POST >=> routef "/lots/%s/complete-shipping" (fun id -> completeShippingHandler id)
-        POST >=> routef "/lots/%s/cancel-manufacturing-completion" (fun id -> cancelHandler id)
-        GET  >=> routef "/lots/%s" (fun id -> getLotHandler id)
-    ]
-```
-
----
-
-## Kotlin 実装の構造
-
-### 依存関係追加（build.gradle.kts）
-
-```kotlin
-dependencies {
-    // 既存に追加
-    implementation("io.arrow-kt:arrow-core:1.2.4")
-}
-```
-
-### ドメインロジック（純粋関数）
-
-```kotlin
-// domain/LotWorkflows.kt
-package salesmanagement.domain
-
-import arrow.core.Either
-import arrow.core.left
-import arrow.core.right
-import java.time.LocalDate
-
-sealed interface LotError {
-    data object LotNotInManufacturing : LotError
-    data object LotNotManufactured : LotError
-    data object LotNotShippingInstructed : LotError
-}
-
-fun completeManufacturing(
-    lot: InventoryLot.Manufacturing,
-    date: LocalDate
-): Either<LotError, InventoryLot.Manufactured> =
-    InventoryLot.Manufactured(
-        common = lot.common,
-        manufacturingCompletedDate = date
-    ).right()
-
-fun instructShipping(
-    lot: InventoryLot.Manufactured,
-    deadline: LocalDate
-): Either<LotError, InventoryLot.ShippingInstructed> =
-    InventoryLot.ShippingInstructed(
-        common = lot.common,
-        manufacturingCompletedDate = lot.manufacturingCompletedDate,
-        shippingDeadlineDate = deadline
-    ).right()
-
-fun completeShipping(
-    lot: InventoryLot.ShippingInstructed,
-    date: LocalDate
-): Either<LotError, InventoryLot.Shipped> =
-    InventoryLot.Shipped(
-        common = lot.common,
-        manufacturingCompletedDate = lot.manufacturingCompletedDate,
-        shippingDeadlineDate = lot.shippingDeadlineDate,
-        shippedDate = date
-    ).right()
-
-fun cancelManufacturingCompletion(
-    lot: InventoryLot.Manufactured
-): Either<LotError, InventoryLot.Manufacturing> =
-    InventoryLot.Manufacturing(common = lot.common).right()
-```
-
-### DB永続化（Exposed）
-
-```kotlin
-// infrastructure/LotTable.kt
-package salesmanagement.infrastructure
-
-import org.jetbrains.exposed.sql.*
-
-object LotTable : Table("lot") {
-    val lotNumberYear = integer("lot_number_year")
-    val lotNumberLocation = text("lot_number_location")
-    val lotNumberSeq = integer("lot_number_seq")
-    val status = text("status")
-    val manufacturingCompletedDate = date("manufacturing_completed_date").nullable()
-    val shippingDeadlineDate = date("shipping_deadline_date").nullable()
-    val shippedDate = date("shipped_date").nullable()
-    // ... 他のカラム
-
-    override val primaryKey = PrimaryKey(lotNumberYear, lotNumberLocation, lotNumberSeq)
-}
-```
-
-### APIルーティング（Ktor）
-
-```kotlin
-// api/LotRoutes.kt
-fun Route.lotRoutes() {
-    route("/lots") {
-        post("/{id}/complete-manufacturing") { /* handler */ }
-        post("/{id}/instruct-shipping") { /* handler */ }
-        post("/{id}/complete-shipping") { /* handler */ }
-        post("/{id}/cancel-manufacturing-completion") { /* handler */ }
-        get("/{id}") { /* handler */ }
-    }
-}
-```
-
----
-
-## DB設計方針
-
-### シングルテーブル + statusカラム方式を採用する理由
-
-在庫ロットの各状態（製造中・製造完了・出荷指示済み・出荷完了）は、共通フィールド（ロット共通 + ロット明細）が同一で、差分は日付カラム数個のみ。この構造ではテーブル分割のメリットが薄い：
-
-- 分割した場合、状態遷移のたびにINSERT + DELETEが必要になり複雑化する
-- JOINが増えるだけで、カラムの重複削減効果がほぼない
-- 状態ごとのテーブルに分けると、「ロット一覧取得」でUNION ALLが必要になる
-
-### 型安全性の担保箇所
-
-| 層 | 担保方法 |
-|---|---|
-| アプリケーション層 | DSLから生成した型（DU / sealed class）で不正な状態遷移をコンパイル時に防ぐ |
-| DB層 | シングルテーブル。statusカラム + nullable日付カラムで永続化。整合性はアプリ層が保証 |
-
-### テーブル設計
-
-```sql
-CREATE TABLE lot (
-    lot_number_year       INTEGER NOT NULL,
-    lot_number_location   TEXT NOT NULL,
-    lot_number_seq        INTEGER NOT NULL,
-    division_code         INTEGER NOT NULL,
-    department_code       INTEGER NOT NULL,
-    section_code          INTEGER NOT NULL,
-    process_category      INTEGER NOT NULL,
-    inspection_category   INTEGER NOT NULL,
-    manufacturing_category INTEGER NOT NULL,
-    status                TEXT NOT NULL,  -- 'manufacturing' | 'manufactured' | 'shipping_instructed' | 'shipped'
-    manufacturing_completed_date DATE,
-    shipping_deadline_date       DATE,
-    shipped_date                 DATE,
-    version               INTEGER NOT NULL DEFAULT 1,  -- 楽観ロック (Step 7 から導入)
-    PRIMARY KEY (lot_number_year, lot_number_location, lot_number_seq)
-);
-
-CREATE TABLE lot_detail (
-    lot_number_year       INTEGER NOT NULL,
-    lot_number_location   TEXT NOT NULL,
-    lot_number_seq        INTEGER NOT NULL,
-    seq                   INTEGER NOT NULL,
-    item_category         TEXT NOT NULL,
-    premium_category      TEXT,
-    product_category_code TEXT NOT NULL,
-    length_spec_lower     NUMERIC NOT NULL,
-    thickness_spec_lower   NUMERIC NOT NULL,
-    thickness_spec_upper   NUMERIC NOT NULL,
-    quality_grade         TEXT NOT NULL,
-    count                 INTEGER NOT NULL,
-    quantity              NUMERIC NOT NULL,
-    pass_fail_category    TEXT,
-    PRIMARY KEY (lot_number_year, lot_number_location, lot_number_seq, seq),
-    FOREIGN KEY (lot_number_year, lot_number_location, lot_number_seq) REFERENCES lot
-);
-```
-
-### 判断基準（他のエンティティにも適用）
-
-- 状態間でカラムの重複が多い（8割以上共通） → シングルテーブル
-- 状態間でカラム構成が大きく異なる → テーブル分割を検討
-- このPoCでは全エンティティがシングルテーブル方式で十分
-
----
-
-## 動作確認
-
-```bash
-# ロット作成
-curl -X POST http://localhost:8080/lots -H "Content-Type: application/json" -d '{...}'
-
-# 製造完了
-curl -X POST http://localhost:8080/lots/2024-A-001/complete-manufacturing \
-  -H "Content-Type: application/json" \
-  -d '{"date": "2024-04-01"}'
-
-# 不正な遷移（製造中に出荷完了 → エラー）
-curl -X POST http://localhost:8080/lots/2024-A-001/complete-shipping \
-  -H "Content-Type: application/json" \
-  -d '{"date": "2024-04-10"}'
-# → 400 Bad Request
+  -d '{"status":"shipped","shipped_date":"2024-03-01"}')
+[ "$STATUS" = "422" ] && echo "PASS PATCH /lots/$LOT_ID/status invalid transition → 422"
 ```
 
 ---
 
 ## 次のステップ
 
-Step 7が完了したら [Step 8: PBT導入](./step08.md) へ進む。
+Step 7が完了したら [Step 8: PBT導入（hypothesis + fast-check）](./step08.md) へ進む。

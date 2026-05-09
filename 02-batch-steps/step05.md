@@ -29,8 +29,8 @@
 docker compose exec db psql -U app -d sales_management \
   -c "UPDATE lot SET status = 'invalid' WHERE lot_number_year = 2026 AND lot_number_location = 'C' AND lot_number_seq IN (100, 500, 2000, 5000, 9000);"
 
-# バッチ実行（maxSkips=10）
-dotnet run --project tools/BatchRunner -- --job=skip-test --date=2026-04
+# バッチ実行（max_skips=10）
+uv run python -m batch.runner --job=skip-test --date=2026-04
 ```
 
 2. バッチが正常完了し、スキップ件数が記録されること:
@@ -44,25 +44,25 @@ docker compose exec db psql -U app -d sales_management \
 3. スキップされたアイテムがログに記録されていること:
 
 ```
-{"level":"Warning","message":"Item skipped","lotId":"2026-C-100","reason":"Invalid status: invalid"}
-{"level":"Warning","message":"Item skipped","lotId":"2026-C-500","reason":"Invalid status: invalid"}
+{"level":"warning","event":"Item skipped","lot_id":"2026-C-100","reason":"Invalid status: invalid"}
+{"level":"warning","event":"Item skipped","lot_id":"2026-C-500","reason":"Invalid status: invalid"}
 ...
 ```
 
 4. スキップ上限を超えるとバッチが失敗すること:
 
 ```bash
-# 不正データを15件に増やし、maxSkips=10 で実行
+# 不正データを15件に増やし、max_skips=10 で実行
 # → "Skip limit exceeded: 11" で FAILED
 ```
 
 ### リトライの確認
 
-5. 一時的なエラーが発生した場合、リトライにより成功すること。デッドロックの再現は困難なため、特定のアイテムで初回だけ例外をスローするテスト用ロジック（例: `if item.id == 3000 && attempt == 1 then throw`）を仕込んで確認する:
+5. 一時的なエラーが発生した場合、リトライにより成功すること。特定のアイテムで初回だけ例外をスローするテスト用ロジックを仕込んで確認する:
 
 ```
-{"level":"Warning","message":"Retry attempt 1","item":"2026-C-3000","error":"Transient error (test)"}
-{"level":"Information","message":"Retry succeeded","item":"2026-C-3000","attempt":2}
+{"level":"warning","event":"Retry attempt","attempt":1,"item":"2026-C-3000","error":"Transient error (test)"}
+{"level":"info","event":"Retry succeeded","item":"2026-C-3000","attempt":2}
 ```
 
 ### リスナーの確認
@@ -70,11 +70,11 @@ docker compose exec db psql -U app -d sales_management \
 6. ジョブの開始/完了、チャンクの開始/完了がログに記録されること:
 
 ```
-{"level":"Information","message":"Job started","job":"skip-test","params":"2026-04"}
-{"level":"Information","message":"Chunk 1 started"}
-{"level":"Information","message":"Chunk 1 completed","processed":998,"skipped":2,"elapsed":"130ms"}
+{"level":"info","event":"Job started","job":"skip-test","params":"2026-04"}
+{"level":"info","event":"Chunk started","chunk":1}
+{"level":"info","event":"Chunk completed","chunk":1,"processed":998,"skipped":2,"elapsed_ms":130}
 ...
-{"level":"Information","message":"Job completed","job":"skip-test","totalProcessed":9995,"totalSkipped":5}
+{"level":"info","event":"Job completed","job":"skip-test","total_processed":9995,"total_skipped":5}
 ```
 
 ---
@@ -83,55 +83,122 @@ docker compose exec db psql -U app -d sales_management \
 
 ### スキップ/リトライの構造
 
-```fsharp
-// F#
-type ChunkConfig = {
-    MaxSkips: int
-    MaxRetries: int
-    IsRetryable: exn -> bool   // デッドロック等 → true
-    IsSkippable: exn -> bool   // バリデーションエラー等 → true
-}
-```
+```python
+# batch/chunk_config.py
+from dataclasses import dataclass, field
+from collections.abc import Callable
 
-```kotlin
-// Kotlin
-data class ChunkConfig(
-    val maxSkips: Int = 10,
-    val maxRetries: Int = 3,
-    val isRetryable: (Throwable) -> Boolean = { it is PSQLException && it.message?.contains("deadlock") == true },
-    val isSkippable: (Throwable) -> Boolean = { it is ValidationException },
-)
+
+@dataclass
+class ChunkConfig:
+    max_skips: int = 10
+    max_retries: int = 3
+    is_retryable: Callable[[Exception], bool] = field(
+        default=lambda exc: "deadlock" in str(exc).lower()
+    )
+    is_skippable: Callable[[Exception], bool] = field(
+        default=lambda exc: isinstance(exc, ValueError)
+    )
 ```
 
 ### リスナーの構造
 
-```fsharp
-// F#: レコード型で定義、デフォルト値付き
-type BatchListeners<'a> = {
-    OnJobStart: string -> unit
-    OnJobEnd: string -> unit
-    OnChunkStart: int -> unit
-    OnChunkEnd: int -> int -> int -> unit  // chunkIndex -> processed -> skipped
-    OnChunkError: int -> exn -> unit
-    OnItemSkipped: 'a -> exn -> unit
-}
+```python
+# batch/listeners.py
+from dataclasses import dataclass, field
+from collections.abc import Callable
+
+
+@dataclass
+class BatchListeners:
+    on_job_start: Callable[[str], None] = field(default=lambda job: None)
+    on_job_end: Callable[[str], None] = field(default=lambda job: None)
+    on_chunk_start: Callable[[int], None] = field(default=lambda idx: None)
+    on_chunk_end: Callable[[int, int, int], None] = field(
+        default=lambda idx, processed, skipped: None
+    )
+    on_chunk_error: Callable[[int, Exception], None] = field(
+        default=lambda idx, exc: None
+    )
+    on_item_skipped: Callable[[object, Exception], None] = field(
+        default=lambda item, exc: None
+    )
 ```
 
-```kotlin
-// Kotlin: data class で定義、デフォルト値付き
-data class BatchListeners<T>(
-    val onJobStart: (String) -> Unit = {},
-    val onJobEnd: (String) -> Unit = {},
-    val onChunkStart: (Int) -> Unit = {},
-    val onChunkEnd: (Int, Int, Int) -> Unit = { _, _, _ -> },
-    val onChunkError: (Int, Throwable) -> Unit = { _, _ -> },
-    val onItemSkipped: (T, Throwable) -> Unit = { _, _ -> },
-)
+### process_in_chunks への組み込み
+
+`process_in_chunks` の引数に `ChunkConfig` と `BatchListeners` を追加し、チャンクループ内でリスナーを呼び出す:
+
+```python
+# batch/chunk.py（Step 2 からの拡張）
+import structlog
+from batch.chunk_config import ChunkConfig
+from batch.listeners import BatchListeners
+
+logger = structlog.get_logger()
+
+
+async def process_item_with_retry(item, processor, config: ChunkConfig, listeners: BatchListeners):
+    for attempt in range(1, config.max_retries + 1):
+        try:
+            return processor(item)
+        except Exception as exc:
+            if attempt < config.max_retries and config.is_retryable(exc):
+                logger.warning("retry attempt", attempt=attempt, error=str(exc))
+                continue
+            if config.is_skippable(exc):
+                listeners.on_item_skipped(item, exc)
+                return None
+            raise
+    return None
+
+
+async def process_in_chunks(
+    session,
+    chunk_size: int,
+    reader,
+    processor,
+    writer,
+    get_id,
+    config: ChunkConfig | None = None,
+    listeners: BatchListeners | None = None,
+) -> tuple[int, int]:
+    cfg = config or ChunkConfig()
+    lst = listeners or BatchListeners()
+    last_id = 0
+    chunk_index = 0
+    total_processed = 0
+    total_skipped = 0
+
+    while True:
+        chunk = [row async for row in reader(last_id, chunk_size)]
+        if not chunk:
+            break
+
+        chunk_index += 1
+        lst.on_chunk_start(chunk_index)
+
+        results = []
+        chunk_skipped = 0
+        for item in chunk:
+            result = await process_item_with_retry(item, processor, cfg, lst)
+            if result is None:
+                chunk_skipped += 1
+                total_skipped += 1
+                if total_skipped > cfg.max_skips:
+                    raise RuntimeError(f"Skip limit exceeded: {total_skipped}")
+            else:
+                results.append(result)
+
+        async with session.begin():
+            await writer(session, results)
+
+        last_id = get_id(chunk[-1])
+        total_processed += len(results)
+        lst.on_chunk_end(chunk_index, len(results), chunk_skipped)
+
+    return total_processed, total_skipped
 ```
-
-### processInChunks への組み込み
-
-`processInChunks` の引数に `ChunkConfig` と `BatchListeners` を追加し、チャンクループ内でリスナーを呼び出す。
 
 ---
 

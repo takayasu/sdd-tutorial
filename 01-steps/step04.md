@@ -4,157 +4,173 @@
 
 ### これは何か
 
-コードフォーマッター（Fantomas / ktfmt）を導入する。フォーマッターとは、コードのインデント（字下げ）、改行位置、スペースの入れ方などを自動的に統一するツール。
+コードの書き方（インデント、改行、クォートスタイルなど）を自動統一するツールを導入する。
+
+- Python: **ruff format**（Black互換の高速フォーマッター）
+- TypeScript/React: **Prettier**
 
 ### なぜやるのか
 
-- 人によってコードの書き方（見た目）がバラバラだと、差分（diff）が読みにくくなる
-- 「タブかスペースか」「括弧の位置」といった議論に時間を使わなくて済む
-- AIが生成したコードも自動的に統一されたスタイルになる
+- 「タブかスペースか」「引用符はシングルかダブルか」といった議論をゼロにする
+- コードレビューで「スタイルの違い」が混在しなくなり、本質的な変更だけを見られる
+- AIが生成したコードも自動整形されるため、一貫したスタイルを保てる
 
 ### 何がうれしいのか
 
-- コードレビューで「見た目」の指摘がゼロになる。ロジックの議論に集中できる
-- CIで `--check` モードを使えば、フォーマットされていないコードがマージされることを防げる
-- `dotnet fantomas src/` / `gradle ktfmtFormat` を実行するだけで全コードが整形される
+- `--check` モードでCIに組み込み、スタイル違反があるとCIが落ちる
+- `--fix` モードで自動修正される
+- チーム全員が同じ設定を使うため「自分の環境では通るのに」がなくなる
 
 ## 完了条件
 
-### F#（Fantomas）
-
 ```bash
-# フォーマット適用
-$ cd ../sales-management/apps/api-fsharp
-$ dotnet fantomas src/
-Formatted: src/SalesManagement/Program.fs
-
-# チェックモード（CI用）— フォーマット済みなら成功
-$ dotnet fantomas --check src/
-All files are correctly formatted.
+# Python: フォーマットチェック
+$ cd backend && ruff format --check src/ tests/
+All checks passed!
 $ echo $?
 0
 
-# もしフォーマット違反があった場合
-$ dotnet fantomas --check src/
-src/SalesManagement/Program.fs was not formatted correctly.
+# Python: 自動修正（開発時）
+$ ruff format src/ tests/
+2 files reformatted
+
+# TypeScript: フォーマットチェック
+$ cd frontend && npx prettier --check "src/**/*.{ts,tsx}"
+Checking formatting...
+All matched files use Prettier code style!
 $ echo $?
-1
-```
+0
 
-### Kotlin（ktfmt）
-
-```bash
-# フォーマット適用
-$ cd kotlin
-$ gradle ktfmtFormat
-BUILD SUCCESSFUL in Xs
-
-# チェックモード（CI用）— フォーマット済みなら成功
-$ gradle ktfmtCheck
-BUILD SUCCESSFUL in Xs
-
-# もしフォーマット違反があった場合
-$ gradle ktfmtCheck
-> Task :ktfmtCheck FAILED
-src/main/kotlin/salesmanagement/Application.kt: Failed to format
-FAILURE: Build failed with an exception.
+# ci.sh が緑
+$ ./ci.sh
+=== フォーマットチェック (Python) ===
+All checks passed!
+=== フォーマットチェック (TypeScript) ===
+All matched files use Prettier code style!
 ```
 
 ---
 
-## F#（Fantomas）
+## Python（ruff format）
 
-### 1. 設定ファイル作成
+### 1. ruff の設定（pyproject.toml に追記）
 
-```bash
-# fsharp/.editorconfig
-cat > fsharp/.editorconfig << 'EOF'
-root = true
+```toml
+[tool.ruff]
+line-length = 100
+target-version = "py312"
 
-[*.fs]
-indent_size = 4
-max_line_length = 120
-fsharp_multiline_bracket_style = cramped
-fsharp_newline_before_multiline_computation_expression = false
-EOF
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
 ```
 
-### 2. フォーマット実行
+### 2. 実行
 
 ```bash
-cd ../sales-management/apps/api-fsharp
-# フォーマット適用
-dotnet fantomas src/
+cd backend
 
 # チェックのみ（CI用）
-dotnet fantomas --check src/
+ruff format --check src/ tests/
+
+# 自動修正（開発時）
+ruff format src/ tests/
 ```
 
-### 3. ci.sh への追加
+### 3. VS Code 設定（.vscode/settings.json）
 
-```bash
-echo "=== フォーマットチェック ==="
-dotnet fantomas --check src/
-if [ $? -ne 0 ]; then
-    echo "フォーマット違反があります。dotnet fantomas src/ を実行してください。"
-    exit 1
-fi
-```
-
----
-
-## Kotlin（ktfmt）
-
-### 1. Gradle設定追加（build.gradle.kts）
-
-```kotlin
-plugins {
-    // 既存のpluginsに追加
-    id("com.ncorti.ktfmt.gradle") version "0.18.0"
-}
-
-ktfmt {
-    kotlinLangStyle()
+```json
+{
+  "[python]": {
+    "editor.defaultFormatter": "charliermarsh.ruff",
+    "editor.formatOnSave": true
+  }
 }
 ```
 
-### 2. フォーマット実行
+---
 
-```bash
-cd kotlin
-# フォーマット適用
-gradle ktfmtFormat
+## TypeScript/React（Prettier）
 
-# チェックのみ（CI用）
-gradle ktfmtCheck
+### 1. .prettierrc
+
+```json
+{
+  "semi": false,
+  "singleQuote": true,
+  "tabWidth": 2,
+  "trailingComma": "all",
+  "printWidth": 100
+}
 ```
 
-### 3. ci.sh への追加
+### 2. .prettierignore
+
+```
+node_modules
+dist
+coverage
+```
+
+### 3. 実行
 
 ```bash
-echo "=== フォーマットチェック ==="
-gradle ktfmtCheck
-if [ $? -ne 0 ]; then
-    echo "フォーマット違反があります。gradle ktfmtFormat を実行してください。"
-    exit 1
-fi
+cd frontend
+
+# チェックのみ（CI用）
+npx prettier --check "src/**/*.{ts,tsx}"
+
+# 自動修正（開発時）
+npx prettier --write "src/**/*.{ts,tsx}"
+```
+
+### 4. VS Code 設定
+
+```json
+{
+  "[typescript]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode",
+    "editor.formatOnSave": true
+  },
+  "[typescriptreact]": {
+    "editor.defaultFormatter": "esbenp.prettier-vscode",
+    "editor.formatOnSave": true
+  }
+}
 ```
 
 ---
 
-## ci.sh の現時点の構成
+## package.json にスクリプト追加
+
+```json
+{
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "format": "prettier --write \"src/**/*.{ts,tsx}\"",
+    "format:check": "prettier --check \"src/**/*.{ts,tsx}\"",
+    "lint": "eslint src/",
+    "test": "vitest",
+    "test:coverage": "vitest run --coverage"
+  }
+}
+```
+
+---
+
+## ci.sh への追加
 
 ```bash
-#!/bin/bash
-set -e
+echo "=== フォーマットチェック (Python) ==="
+cd backend
+ruff format --check src/ tests/
+cd ..
 
-echo "=== ビルド ==="
-# F#: dotnet build --warnaserror
-# Kotlin: gradle build
-
-echo "=== フォーマットチェック ==="
-# F#: dotnet fantomas --check src/
-# Kotlin: gradle ktfmtCheck
+echo "=== フォーマットチェック (TypeScript) ==="
+cd frontend
+npx prettier --check "src/**/*.{ts,tsx}"
+cd ..
 ```
 
 ---

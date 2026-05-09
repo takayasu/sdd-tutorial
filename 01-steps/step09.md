@@ -4,122 +4,188 @@
 
 ### これは何か
 
-テストカバレッジ（コードのうち、テストで実行された割合）を計測する。例えば「カバレッジ85%」は、コード全体の85%がテスト実行時に通過したことを意味する。
+テストがコードのどの部分をどれだけ実行しているかを計測し、CI で閾値を強制する。
+
+- Python: **pytest-cov**（`coverage.py` のラッパー）
+- TypeScript: **@vitest/coverage-v8**（V8 の組み込みカバレッジエンジン）
 
 ### なぜやるのか
 
-- テストを書いたつもりでも、実は通っていないコードパスがあるかもしれない
-- カバレッジを可視化することで「テストが足りていない箇所」が一目でわかる
-- 品質の客観的な指標として使える
+- AIが生成したコードに「テストが一行も通っていないパス」が存在することがある
+- カバレッジ閾値を CI に組み込むと、テストを書かずにコードだけ追加するプルリクエストがブロックされる
+- 80% という数字に意味があるというより、「下がり続けない」ことを自動保証するのが目的
 
 ### 何がうれしいのか
 
-- 「テストは書いたけど本当に十分か？」という不安に数値で答えられる
-- HTMLレポートで「どの行が通っていないか」を視覚的に確認できる
-- CIで計測し続けることで、カバレッジが下がったら気づける
+- `coverage html` で「赤く塗られた行」が一目でわかる
+- ブランチカバレッジで `if` の両方の分岐がテストされているか確認できる
+- CIが `Fail — coverage 74%（required: 80%）` と言ってくれる
 
 ## 完了条件
 
-### F#
-
 ```bash
-$ cd ../sales-management/apps/api-fsharp
-$ dotnet test --collect:"XPlat Code Coverage" --results-directory ./coverage
-  Passed!  - Failed:     0, Passed:     3, Skipped:     0, Total:     3
+# Python カバレッジ（閾値80%）
+$ cd backend && pytest --cov=src --cov-fail-under=80
+...
+TOTAL   142   8   94%
+Required test coverage of 80% reached. Total coverage: 94.00%
 
-# カバレッジレポートが生成されていることを確認
-$ ls coverage/*/coverage.cobertura.xml
-coverage/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx/coverage.cobertura.xml
+# TypeScript カバレッジ
+$ cd frontend && npx vitest run --coverage
+ % Coverage report from v8
+ File        | % Stmts | % Branch | % Funcs | % Lines
+ All files   |   88.00 |    85.00 |   90.00 |   88.00
 
-# カバレッジ率を確認
-$ grep -oP 'line-rate="\K[^"]+' coverage/*/coverage.cobertura.xml
-0.85
-```
-
-### Kotlin
-
-```bash
-$ cd kotlin
-$ gradle test jacocoTestReport
-BUILD SUCCESSFUL in Xs
-
-# レポートが生成されていることを確認
-$ ls build/reports/jacoco/test/html/index.html
-build/reports/jacoco/test/html/index.html
-
-# ブラウザで確認可能
-# open build/reports/jacoco/test/html/index.html
+# ci.sh が緑
+$ ./ci.sh
+=== カバレッジ (Python) ===
+Required test coverage of 80% reached.
+=== カバレッジ (TypeScript) ===
+（閾値超過）
 ```
 
 ---
 
-## F#（coverlet）
+## Python（pytest-cov）
 
-### 1. パッケージ追加
+### 1. 依存追加（pyproject.toml）
 
-```bash
-cd ../sales-management/apps/api-fsharp/tests/SalesManagement.Tests
-dotnet add package coverlet.collector
+```toml
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+    "ruff>=0.6",
+    "mypy>=1.10",
+    "hypothesis>=6",
+    "pytest-cov>=5",
+]
 ```
 
-### 2. 実行
-
 ```bash
-cd ../sales-management/apps/api-fsharp
-dotnet test --collect:"XPlat Code Coverage" --results-directory ./coverage
+cd backend && uv sync
 ```
 
-### 3. レポート生成（オプション）
+### 2. pytest 設定（pyproject.toml）
 
-```bash
-# ReportGeneratorでHTML化
-dotnet tool install -g dotnet-reportgenerator-globaltool
-reportgenerator -reports:coverage/**/coverage.cobertura.xml -targetdir:coverage/report -reporttypes:Html
+```toml
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "--cov=src --cov-branch --cov-report=term-missing --cov-fail-under=80"
 ```
 
-### 4. ci.sh への追加
+### 3. カバレッジ設定（pyproject.toml）
+
+```toml
+[tool.coverage.run]
+branch = true
+source = ["src"]
+omit = [
+    "src/infra/models.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]
+```
+
+### 4. 実行
 
 ```bash
-echo "=== テスト + カバレッジ ==="
-dotnet test --collect:"XPlat Code Coverage" --results-directory ./coverage
+cd backend
+
+# ターミナル出力（CI用）
+pytest --cov=src --cov-fail-under=80
+
+# HTML レポート（開発時）
+pytest --cov=src --cov-report=html
+open htmlcov/index.html
 ```
 
 ---
 
-## Kotlin（JaCoCo）
+## TypeScript（@vitest/coverage-v8）
 
-### 1. Gradle設定追加（build.gradle.kts）
+### 1. 依存追加
 
-```kotlin
-plugins {
-    // 既存に追加
-    jacoco
+```bash
+cd frontend
+pnpm add -D @vitest/coverage-v8
+```
+
+### 2. vite.config.ts に追記
+
+```typescript
+export default defineConfig({
+  // ...
+  test: {
+    globals: true,
+    environment: 'jsdom',
+    setupFiles: ['./tests/setup.ts'],
+    coverage: {
+      provider: 'v8',
+      reporter: ['text', 'lcov', 'html'],
+      thresholds: {
+        lines: 80,
+        branches: 80,
+        functions: 80,
+        statements: 80,
+      },
+      exclude: [
+        'src/main.tsx',
+        'src/vite-env.d.ts',
+        '**/*.d.ts',
+        'tests/**',
+      ],
+    },
+  },
+})
+```
+
+### 3. 実行
+
+```bash
+cd frontend
+
+# ターミナル出力（CI用）
+npx vitest run --coverage
+
+# HTML レポート
+npx vitest run --coverage --reporter=html
+open coverage/index.html
+```
+
+### 4. package.json スクリプト更新
+
+```json
+{
+  "scripts": {
+    "test": "vitest",
+    "test:coverage": "vitest run --coverage"
+  }
 }
-
-tasks.jacocoTestReport {
-    dependsOn(tasks.test)
-    reports {
-        xml.required.set(true)
-        html.required.set(true)
-    }
-}
-```
-
-### 2. 実行
-
-```bash
-gradle test jacocoTestReport
-# レポートは build/reports/jacoco/test/html/index.html に出力
-```
-
-### 3. ci.sh への追加
-
-```bash
-echo "=== テスト + カバレッジ ==="
-gradle test jacocoTestReport
 ```
 
 ---
+
+## ci.sh への追加
+
+```bash
+echo "=== カバレッジ (Python) ==="
+cd backend
+pytest --cov=src --cov-fail-under=80 -q
+cd ..
+
+echo "=== カバレッジ (TypeScript) ==="
+cd frontend
+npx vitest run --coverage
+cd ..
+```
 
 ## ci.sh の現時点の構成
 
@@ -127,25 +193,35 @@ gradle test jacocoTestReport
 #!/bin/bash
 set -e
 
+echo "=== DB起動確認 ==="
+docker compose up -d db
+until docker compose exec db pg_isready -U app -d sales_management >/dev/null 2>&1; do
+  sleep 2
+done
+
 echo "=== マイグレーション ==="
-# F#: dotnet run --project tools/Migrator
-# Kotlin: gradle flywayMigrate
+cd backend && alembic upgrade head && cd ..
 
-echo "=== ビルド ==="
-# F#: dotnet build --warnaserror
-# Kotlin: gradle build
+echo "=== フォーマットチェック (Python) ==="
+cd backend && ruff format --check src/ tests/ && cd ..
 
-echo "=== フォーマットチェック ==="
-# F#: dotnet fantomas --check src/
-# Kotlin: gradle ktfmtCheck
+echo "=== フォーマットチェック (TypeScript) ==="
+cd frontend && npx prettier --check "src/**/*.{ts,tsx}" && cd ..
 
-echo "=== リンター ==="
-# F#: dotnet tool run fsharplint lint src/SalesManagement/SalesManagement.fsproj
-# Kotlin: gradle detekt
+echo "=== リンター (Python) ==="
+cd backend && ruff check src/ tests/ && cd ..
 
-echo "=== テスト + カバレッジ ==="
-# F#: dotnet test --collect:"XPlat Code Coverage" --results-directory ./coverage
-# Kotlin: gradle test jacocoTestReport
+echo "=== リンター (TypeScript) ==="
+cd frontend && npx eslint src/ && cd ..
+
+echo "=== カバレッジ (Python) ==="
+cd backend && pytest --cov=src --cov-fail-under=80 -q && cd ..
+
+echo "=== カバレッジ (TypeScript) ==="
+cd frontend && npx vitest run --coverage && cd ..
+
+echo "=== verify (smoke) ==="
+# Step 1 で導入済み
 ```
 
 ---

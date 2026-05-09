@@ -4,11 +4,11 @@
 
 ### これは何か
 
-Renovate は依存ライブラリのバージョン更新を自動で提案するツール。GitHub App / GitLab App / セルフホスト / ローカル CLI として動く。`build.gradle.kts`、`*.csproj`、`docker-compose.yml`、`renovate.json` などをスキャンし、新しいバージョンが出ていれば「アップデート PR」を自動生成する。
+Renovate は依存ライブラリのバージョン更新を自動で提案するツール。GitHub App / セルフホスト / ローカル CLI として動く。`pyproject.toml`、`package.json`、`docker-compose.yml` などをスキャンし、新しいバージョンが出ていれば「アップデート PR」を自動生成する。
 
 ### なぜやるのか
 
-- Step 10 の Trivy が脆弱性を検出しても、人間が手で対応すると遅い。Renovate を組み合わせれば「脆弱性検出 → 即更新 PR」が自動化される
+- Step 10 の pip-audit/pnpm audit が脆弱性を検出しても、人間が手で対応すると遅い。Renovate を組み合わせれば「脆弱性検出 → 即更新 PR」が自動化される
 - 依存更新を後回しにすると指数関数的に痛くなる（一度に大量のメジャーアップデートを処理することになる）
 - AIエージェントの skill（特定ライブラリ API の知識）は古い API を覚えていることがある。常に最新化しておけばエージェントの skill ドリフトを抑えられる
 
@@ -16,22 +16,22 @@ Renovate は依存ライブラリのバージョン更新を自動で提案す�
 
 - パッチ・マイナーアップデートが自動マージされ、メンテナンス工数が激減
 - メジャーアップデートはラベル付きで提案され、人間が判断
-- Trivy の SARIF 出力（Step 21）と組み合わせて、脆弱性のある依存を優先的に更新できる
+- Step 21 の SARIF 出力と組み合わせて、脆弱性のある依存を優先的に更新できる
 
 ## 完了条件
 
 ```bash
 $ npx renovate --dry-run --platform=local --autodiscover=false
-DEBUG: 12 dependencies found
+DEBUG: 15 dependencies found
 INFO: 3 updates available:
-  - Giraffe 7.0.2 → 7.0.4 (minor)
-  - kotlinx.serialization 1.6.0 → 1.7.0 (minor)
+  - fastapi 0.110.0 → 0.111.0 (minor)
+  - react 18.2.0 → 18.3.0 (minor)
   - postgres:16-alpine → 17-alpine (major)
 $ echo $?
 0
 
 $ ls renovate-out/
-upgrades.json  log.txt
+log.txt
 ```
 
 ---
@@ -67,12 +67,12 @@ upgrades.json  log.txt
       "addLabels": ["docker"]
     },
     {
-      "matchManagers": ["nuget"],
-      "addLabels": ["nuget"]
+      "matchManagers": ["pip_requirements", "pyproject"],
+      "addLabels": ["python"]
     },
     {
-      "matchManagers": ["gradle"],
-      "addLabels": ["gradle"]
+      "matchManagers": ["npm"],
+      "addLabels": ["npm"]
     }
   ],
   "vulnerabilityAlerts": {
@@ -109,25 +109,24 @@ RENOVATE_PLATFORM=local \
 RENOVATE_AUTODISCOVER=false \
   renovate --dry-run > renovate-out/log.txt 2>&1
 
-# 検出された更新を構造化して取得
-grep -oP 'depName: \K[^,]+' renovate-out/log.txt | sort -u > renovate-out/dependencies.txt
+# 検出された更新を確認
+grep "Update available" renovate-out/log.txt
 ```
 
 ---
 
-## 3. Trivy 連携: 脆弱性のある依存を優先更新
+## 3. pip-audit SARIF 連携: 脆弱性のある依存を優先更新
 
-Step 21 で Trivy の SARIF 出力が `ci-results/sarif/trivy.sarif` にある。ここから CVE の影響を受けるパッケージ名を抽出し、`renovate.json` の優先度を動的に上げる。
+Step 21 で pip-audit の SARIF 出力が `ci-results/sarif/pip_audit.sarif` にある。ここから CVE の影響を受けるパッケージ名を抽出し、`renovate.json` の優先度を動的に上げる。
 
-`scripts/prioritize-from-trivy.sh`:
+`scripts/prioritize-from-sarif.sh`:
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-SARIF="${1:-ci-results/sarif/trivy.sarif}"
+SARIF="${1:-ci-results/sarif/pip_audit.sarif}"
 RENOVATE_CONFIG="${2:-renovate.json}"
 
-# Trivy SARIF から脆弱なパッケージ名を抽出
 VULN_PKGS=$(jq -r '
   .runs[].results[]
   | .properties["package_name"] // empty
@@ -138,7 +137,6 @@ if [ -z "$VULN_PKGS" ]; then
   exit 0
 fi
 
-# packageRules に優先度ルールを追加
 TMP=$(mktemp)
 jq --argjson pkgs "$(echo "$VULN_PKGS" | jq -R . | jq -s .)" '
   .packageRules += [{
@@ -151,10 +149,10 @@ jq --argjson pkgs "$(echo "$VULN_PKGS" | jq -R . | jq -s .)" '
 ' "$RENOVATE_CONFIG" > "$TMP"
 mv "$TMP" "$RENOVATE_CONFIG"
 
-echo "Trivy の脆弱パッケージ ${VULN_PKGS} を Renovate の優先更新リストに追加"
+echo "脆弱パッケージ ${VULN_PKGS} を Renovate の優先更新リストに追加"
 ```
 
-このスクリプトをCI で Trivy 実行直後に呼び出すと、脆弱性検出 → 自動的に優先更新ルール追加 → 次の Renovate 実行で即更新 PR、というループが組める。
+このスクリプトを CI で pip-audit 実行直後に呼び出すと、脆弱性検出 → 自動的に優先更新ルール追加 → 次の Renovate 実行で即更新 PR、というループが組める。
 
 ---
 
@@ -175,8 +173,8 @@ PoC では GitHub Actions を使わない方針だが、本番運用するなら
 
 ```bash
 echo "=== 脆弱性パッケージを Renovate 優先化 ==="
-bash scripts/prioritize-from-trivy.sh \
-  ci-results/sarif/trivy.sarif renovate.json || true
+bash scripts/prioritize-from-sarif.sh \
+  ci-results/sarif/pip_audit.sarif renovate.json || true
 
 echo "=== 依存更新チェック (dry-run) ==="
 mkdir -p renovate-out
@@ -184,78 +182,11 @@ RENOVATE_PLATFORM=local \
 RENOVATE_AUTODISCOVER=false \
   npx --yes renovate --dry-run > ci-results/renovate.log 2>&1 || true
 
-# 更新候補数をサマリ
-UPDATE_COUNT=$(grep -c "Update available:" ci-results/renovate.log || true)
+UPDATE_COUNT=$(grep -c "Update available:" ci-results/renovate.log || echo "0")
 echo "更新候補: $UPDATE_COUNT 件"
 ```
 
 `|| true` を付けているのは「更新候補が見つかっただけで CI を失敗させない」ため。CI を落とすか落とさないかは運用判断。
-
----
-
-## ci.sh の現時点の構成
-
-```bash
-#!/bin/bash
-set -e
-
-echo "=== ci-results/ 初期化 ==="
-mkdir -p ci-results/sarif
-
-echo "=== マイグレーション ==="
-echo "=== ビルド ==="
-echo "=== フォーマットチェック ==="
-echo "=== リンター ==="
-echo "=== テスト + カバレッジ ==="
-
-echo "=== ミューテーションテスト ==="
-(cd ../sales-management/apps/api-fsharp && dotnet stryker)
-cd kotlin && gradle pitest && cd ..
-
-echo "=== アーキテクチャ適合性 ==="
-(cd ../sales-management/apps/api-fsharp && dotnet test --filter "Category=Architecture")
-cd kotlin && gradle test --tests "*ArchitectureTest*" && cd ..
-
-echo "=== コントラクトテスト (Pact) ==="
-(cd ../sales-management/apps/api-fsharp && dotnet test --filter "Category=Pact")
-cd kotlin && gradle pactVerify && cd ..
-
-echo "=== シークレット検出 (SARIF) ==="
-gitleaks detect --source . \
-  --report-format sarif --report-path ci-results/sarif/gitleaks.sarif --exit-code 1
-
-echo "=== SCA (SARIF) ==="
-trivy fs --scanners vuln --severity HIGH,CRITICAL \
-  --format sarif --output ci-results/sarif/trivy.sarif .
-
-echo "=== SAST (SonarQube) ==="
-gradle sonar
-bash scripts/sonar-to-sarif.sh sales-management-kotlin ci-results/sarif/sonar.sarif
-
-echo "=== DAST (OWASP ZAP, SARIF) ==="
-# (アプリ起動 → ZAP実行 → アプリ停止)
-
-echo "=== SBOM 生成 ==="
-cd ../sales-management/apps/api-fsharp && \
-  dotnet CycloneDX src/SalesManagement/SalesManagement.fsproj \
-    --json --output ../ci-results --filename sbom-fsharp.cdx.json && \
-  cd ..
-cd kotlin && gradle cyclonedxBom && cd ..
-
-echo "=== 脆弱性パッケージを Renovate 優先化 ==="
-bash scripts/prioritize-from-trivy.sh \
-  ci-results/sarif/trivy.sarif renovate.json || true
-
-echo "=== 依存更新チェック (dry-run) ==="
-RENOVATE_PLATFORM=local RENOVATE_AUTODISCOVER=false \
-  npx --yes renovate --dry-run > ci-results/renovate.log 2>&1 || true
-
-echo "=== SARIF マージ ==="
-sarif merge ci-results/sarif/*.sarif \
-  --output-file-path ci-results/merged.sarif --recurse false
-
-echo "=== CI完了 ==="
-```
 
 ---
 
@@ -266,7 +197,7 @@ echo "=== CI完了 ==="
 | メンテナンス自動化 | 依存ライブラリの陳腐化を防ぐ |
 | Skills のリフレッシュ | エージェントが古い API を覚えていることを抑制 |
 
-Trivy（Step 10/21）の SARIF を入力に、Renovate の `renovate.json` を出力として動的に変更するループが Step 26 の核心。これにより「脆弱性検出 → 自動修正 PR」が完全に閉じる。Step 30 の RALPH ループから見ると、依存メンテナンスをエージェントが意識しなくて済む、つまり PRD タスクに集中できる効果がある。
+pip-audit（Step 10/21）の SARIF を入力に、Renovate の `renovate.json` を出力として動的に変更するループが Step 26 の核心。これにより「脆弱性検出 → 自動修正 PR」が完全に閉じる。Step 30 の RALPH ループから見ると、依存メンテナンスをエージェントが意識しなくて済む、つまり PRD タスクに集中できる効果がある。
 
 ---
 
